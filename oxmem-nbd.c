@@ -78,7 +78,8 @@ static int oxmem_write_blocking(const char *buf, size_t size, off_t offset,
 static int send_and_wait_response(struct ox_packet_struct *send_ox,
 				  struct ox_packet_struct *recv_ox,
 				  int expect_data);
-
+static int copy_data_from_response(char *target_buf,
+				   struct ox_packet_struct *recv_ox);
 /**
  * Signal handler for graceful shutdown
  */
@@ -190,6 +191,19 @@ void free_send_ox_list(int source)
     pthread_mutex_unlock(&send_ox_list_lock);
 }
 
+void update_send_ox_credit(struct ox_packet_struct *send_ox)
+{
+    int credit;
+
+    if (send_ox->tloe_hdr.chan == 0) {
+	credit = get_ack_credit(CHANNEL_D);
+	if (credit >= 0) {
+	    send_ox->tloe_hdr.credit = credit;
+	    send_ox->tloe_hdr.chan = CHANNEL_D;
+	}
+    }
+}
+
 /**
  * Send OmniXtend packet and wait for response (blocking with timeout)
  * This replaces the entire queue system!
@@ -214,13 +228,8 @@ static int send_and_wait_response(struct ox_packet_struct *send_ox,
     set_seq_num_to_ox_packet(global_state.oxmem_info.connection_id,
 			     send_ox);
 
-    if (send_ox->tloe_hdr.chan == 0) {
-	credit = get_ack_credit(CHANNEL_D);
-	if (credit >= 0) {
-	    send_ox->tloe_hdr.credit = credit;
-	    send_ox->tloe_hdr.chan = CHANNEL_D;
-	}
-    }
+    update_send_ox_credit(send_ox);
+
     // Get a send_ox list slot
     if (expect_data) {
 	sem_init(&sem, 0, 0);
@@ -273,6 +282,169 @@ static int send_and_wait_response(struct ox_packet_struct *send_ox,
     // Free the source slot
     free_send_ox_list(source);
     sem_destroy(&sem);
+
+    return 0;
+}
+
+static int send_and_wait_data(struct ox_packet_struct *send_ox,
+				  char * data_buffer)
+{
+    char send_buffer[BUFFER_SIZE];
+    char recv_buffer[BUFFER_SIZE];
+    struct ox_packet_struct recv_ox;
+    int send_size, recv_size;
+    struct timeval tv;
+    int ret;
+    int credit;
+    sem_t sem;
+    int source = -1;
+    struct tl_msg_header_chan_AD tl_msg_header;
+    int64_t be64_temp;
+
+
+    // Set sequence number, credit and convert to packet
+    set_seq_num_to_ox_packet(global_state.oxmem_info.connection_id,
+			     send_ox);
+
+    update_send_ox_credit(send_ox);
+
+    // Get a send_ox list slot
+	sem_init(&sem, 0, 0);
+	source = get_send_ox_list(&sem, recv_buffer, &recv_size);
+	if (source < 0) {
+	    printf("send_ox_list is full.\n");
+	    exit(0);
+	}
+	// Set source field in TileLink message (only if TileLink message exists)
+	if (send_ox->tl_msg_mask != 0 && send_ox->flits != NULL) {
+	    // Find first valid flit
+	    int i;
+	    for (i = 0; i < 64; i++) {
+		if ((send_ox->tl_msg_mask >> i) & 0x1)
+		    break;
+	    }
+
+	    if (i < 64) {
+		// Extract TileLink header, set source, write back
+		be64_temp = be64toh(send_ox->flits[i]);
+		memcpy(&tl_msg_header, &be64_temp, sizeof(uint64_t));
+		tl_msg_header.source = source;
+		be64_temp = htobe64(*(uint64_t *) & (tl_msg_header));
+		send_ox->flits[i] = be64_temp;
+	    }
+	}
+
+    ox_struct_to_packet(send_ox, send_buffer, &send_size);
+
+    // Send packet
+    ret = send(global_state.oxmem_info.sockfd, send_buffer, send_size, 0);
+    if (ret < 0) {
+	perror("send failed");
+	return -EIO;
+    }
+
+	// Wait for response
+	sem_wait(&sem);
+
+	// Parse response
+	packet_to_ox_struct(recv_buffer, recv_size, &recv_ox);
+
+    ret = copy_data_from_response(data_buffer, &recv_ox);
+
+    // Free the source slot
+    free_send_ox_list(source);
+    sem_destroy(&sem);
+
+    return 0;
+}
+
+static int send_and_wait_ack(struct ox_packet_struct *send_ox)
+{
+    char send_buffer[BUFFER_SIZE];
+    char recv_buffer[BUFFER_SIZE];
+    int send_size, recv_size;
+    struct timeval tv;
+    int ret;
+    int credit;
+    sem_t sem;
+    int source = -1;
+    struct tl_msg_header_chan_AD tl_msg_header;
+    int64_t be64_temp;
+
+
+    // Set sequence number, credit and convert to packet
+    set_seq_num_to_ox_packet(global_state.oxmem_info.connection_id,
+			     send_ox);
+
+    update_send_ox_credit(send_ox);
+
+    // Get a send_ox list slot
+	sem_init(&sem, 0, 0);
+	source = get_send_ox_list(&sem, recv_buffer, &recv_size);
+	if (source < 0) {
+	    printf("send_ox_list is full.\n");
+	    exit(0);
+	}
+	// Set source field in TileLink message (only if TileLink message exists)
+	if (send_ox->tl_msg_mask != 0 && send_ox->flits != NULL) {
+	    // Find first valid flit
+	    int i;
+	    for (i = 0; i < 64; i++) {
+		if ((send_ox->tl_msg_mask >> i) & 0x1)
+		    break;
+	    }
+
+	    if (i < 64) {
+		// Extract TileLink header, set source, write back
+		be64_temp = be64toh(send_ox->flits[i]);
+		memcpy(&tl_msg_header, &be64_temp, sizeof(uint64_t));
+		tl_msg_header.source = source;
+		be64_temp = htobe64(*(uint64_t *) & (tl_msg_header));
+		send_ox->flits[i] = be64_temp;
+	    }
+	}
+
+    ox_struct_to_packet(send_ox, send_buffer, &send_size);
+
+    // Send packet
+    ret = send(global_state.oxmem_info.sockfd, send_buffer, send_size, 0);
+    if (ret < 0) {
+	perror("send failed");
+	return -EIO;
+    }
+
+	// Wait for response
+	sem_wait(&sem);
+
+    // Free the source slot
+    free_send_ox_list(source);
+    sem_destroy(&sem);
+
+    return 0;
+}
+
+
+/* send_and_forget - send ox_packet and don't care about reply */
+static int send_and_forget(struct ox_packet_struct *send_ox)
+{
+    char send_buffer[BUFFER_SIZE];
+    int send_size;
+    int ret;
+
+    // Set sequence number, credit and convert to packet
+    set_seq_num_to_ox_packet(global_state.oxmem_info.connection_id,
+			     send_ox);
+
+    update_send_ox_credit(send_ox);
+
+    ox_struct_to_packet(send_ox, send_buffer, &send_size);
+
+    // Send packet
+    ret = send(global_state.oxmem_info.sockfd, send_buffer, send_size, 0);
+    if (ret < 0) {
+	perror("send failed");
+	return -EIO;
+    }
 
     return 0;
 }
@@ -432,19 +604,20 @@ static int oxmem_read_blocking(char *buf, size_t size, off_t offset,
 			   &send_ox, send_flits);
 
 	// Send and wait for response (blocking)
-	ret = send_and_wait_response(&send_ox, &recv_ox, 1);
+	ret = send_and_wait_data(&send_ox, buf + bytes_read);
 	if (ret < 0) {
 	    fprintf(stderr,
 		    "Get request failed at offset %ld (device %d)\n",
 		    bytes_read, bdev->device_index);
 	    return ret;
 	}
+
 	// Copy data from response
-	ret = copy_data_from_response(buf + bytes_read, &recv_ox);
-	if (ret < 0) {
-	    fprintf(stderr, "Failed to extract data from response\n");
-	    return -EIO;
-	}
+//	ret = copy_data_from_response(buf + bytes_read, &recv_ox);
+//	if (ret < 0) {
+//	    fprintf(stderr, "Failed to extract data from response\n");
+//	    return -EIO;
+//	}
 
 	bytes_read += chunk_size;
     }
@@ -458,7 +631,7 @@ static int oxmem_read_blocking(char *buf, size_t size, off_t offset,
 static int oxmem_write_blocking(const char *buf, size_t size, off_t offset,
 				struct oxmem_bdev *bdev)
 {
-    struct ox_packet_struct send_ox, recv_ox;
+    struct ox_packet_struct send_ox;
     uint64_t send_flits[256];
     size_t bytes_written = 0;
     size_t chunk_size;
@@ -492,7 +665,7 @@ static int oxmem_write_blocking(const char *buf, size_t size, off_t offset,
 			       send_flits);
 
 	// Send and wait for acknowledgment (blocking)
-	ret = send_and_wait_response(&send_ox, &recv_ox, 1);
+	ret = send_and_wait_ack(&send_ox);
 	if (ret < 0) {
 	    fprintf(stderr,
 		    "Put request failed at offset %ld (device %d)\n",
@@ -667,7 +840,7 @@ static void cleanup_and_exit(void)
 				     &send_ox);
 
 	// Try to send disconnect (ignore errors during shutdown)
-	send_and_wait_response(&send_ox, &recv_ox, 0);
+	send_and_forget(&send_ox);
 
 	delete_connection(global_state.oxmem_info.connection_id);
 	global_state.oxmem_info.connection_id = -1;
@@ -910,14 +1083,13 @@ int main(int argc, char *argv[])
 
     send_ox.tloe_hdr.chan = CHANNEL_A;
     send_ox.tloe_hdr.credit = DEFAULT_CREDIT;
-    // Send on Channel A (blocking)
-    send_and_wait_response(&send_ox, &recv_ox, 0);
+    // Send on Channel A
+    send_and_forget(&send_ox);
 
-    // Send on Channel D (blocking)
+    // Send on Channel D
     send_ox.tloe_hdr.msg_type = NORMAL;
     send_ox.tloe_hdr.chan = CHANNEL_D;
-    send_ox.tloe_hdr.credit = DEFAULT_CREDIT;
-    send_and_wait_response(&send_ox, &recv_ox, 0);
+    send_and_forget(&send_ox);
 
     printf("Connection established (ID: %d)\n",
 	   global_state.oxmem_info.connection_id);
