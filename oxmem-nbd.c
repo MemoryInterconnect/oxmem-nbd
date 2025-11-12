@@ -28,6 +28,7 @@
 #define READ_WRITE_UNIT 1024
 #define RESPONSE_TIMEOUT_SEC 10
 #define MAX_NBD_DEVICES 16
+#define MAX_SEND_OX_LIST 1000
 
 // Per-NBD device state
 struct oxmem_bdev {
@@ -53,11 +54,21 @@ struct oxmem_global {
     int num_devices;
 };
 
+struct send_ox_list_entry {
+    sem_t *sem;
+    char *recv_buffer;
+    int *recv_size;
+};
+struct send_ox_list_entry send_ox_list[MAX_SEND_OX_LIST];
+static pthread_mutex_t send_ox_list_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t credit_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static struct oxmem_global global_state;
 static volatile sig_atomic_t shutdown_requested = 0;
 
 // Function declarations
 void *nbd_server_thread(void *arg);
+void *recv_thread(void *arg);
 static void signal_handler(int sig);
 static void cleanup_and_exit(void);
 static int oxmem_read_blocking(char *buf, size_t size, off_t offset,
@@ -91,9 +102,12 @@ static void signal_handler(int sig)
 int get_ack_credit(int channel)
 {
     int i;
+    int credit;
 
     if (channel < CHANNEL_A || channel > CHANNEL_E)
 	return 0;
+
+    pthread_mutex_lock(&credit_lock);
 
     // Round down to power of 2
     for (i = 31; i >= 0; i--) {
@@ -102,11 +116,15 @@ int get_ack_credit(int channel)
 	}
     }
 
+    credit = i;
+
     if (i >= 0)
 	//reduce credit_in_use
 	global_state.credit_in_use[channel - 1] -= (1UL << i);
 
-    return i;
+    pthread_mutex_unlock(&credit_lock);
+
+    return credit;
 
 }
 
@@ -142,6 +160,35 @@ int get_used_credit(struct ox_packet_struct *recv_ox, int channel)
     return credit;
 }
 
+int get_send_ox_list(sem_t * sem, char *recv_buffer, int *recv_size)
+{
+    int source;
+
+    pthread_mutex_lock(&send_ox_list_lock);
+
+    for (source = 0; source < MAX_SEND_OX_LIST; source++) {
+	if (send_ox_list[source].sem == NULL) {
+	    send_ox_list[source].sem = sem;
+	    send_ox_list[source].recv_buffer = recv_buffer;
+	    send_ox_list[source].recv_size = recv_size;
+
+	    pthread_mutex_unlock(&send_ox_list_lock);
+	    return source;
+	}
+    }
+
+    pthread_mutex_unlock(&send_ox_list_lock);
+    return -1;
+}
+
+void free_send_ox_list(int source)
+{
+    pthread_mutex_lock(&send_ox_list_lock);
+    send_ox_list[source].sem = NULL;
+    send_ox_list[source].recv_buffer = NULL;
+    send_ox_list[source].recv_size = NULL;
+    pthread_mutex_unlock(&send_ox_list_lock);
+}
 
 /**
  * Send OmniXtend packet and wait for response (blocking with timeout)
@@ -154,10 +201,14 @@ static int send_and_wait_response(struct ox_packet_struct *send_ox,
     char send_buffer[BUFFER_SIZE];
     char recv_buffer[BUFFER_SIZE];
     int send_size, recv_size;
-    fd_set readfds;
     struct timeval tv;
     int ret;
     int credit;
+    sem_t sem;
+    int source = -1;
+    struct tl_msg_header_chan_AD tl_msg_header;
+    int64_t be64_temp;
+
 
     // Set sequence number, credit and convert to packet
     set_seq_num_to_ox_packet(global_state.oxmem_info.connection_id,
@@ -170,6 +221,33 @@ static int send_and_wait_response(struct ox_packet_struct *send_ox,
 	    send_ox->tloe_hdr.chan = CHANNEL_D;
 	}
     }
+    // Get a send_ox list slot
+    if (expect_data) {
+	sem_init(&sem, 0, 0);
+	source = get_send_ox_list(&sem, recv_buffer, &recv_size);
+	if (source < 0) {
+	    printf("send_ox_list is full.\n");
+	    exit(0);
+	}
+	// Set source field in TileLink message (only if TileLink message exists)
+	if (send_ox->tl_msg_mask != 0 && send_ox->flits != NULL) {
+	    // Find first valid flit
+	    int i;
+	    for (i = 0; i < 64; i++) {
+		if ((send_ox->tl_msg_mask >> i) & 0x1)
+		    break;
+	    }
+
+	    if (i < 64) {
+		// Extract TileLink header, set source, write back
+		be64_temp = be64toh(send_ox->flits[i]);
+		memcpy(&tl_msg_header, &be64_temp, sizeof(uint64_t));
+		tl_msg_header.source = source;
+		be64_temp = htobe64(*(uint64_t *) & (tl_msg_header));
+		send_ox->flits[i] = be64_temp;
+	    }
+	}
+    }
 
     ox_struct_to_packet(send_ox, send_buffer, &send_size);
 
@@ -179,51 +257,105 @@ static int send_and_wait_response(struct ox_packet_struct *send_ox,
 	perror("send failed");
 	return -EIO;
     }
-    // Wait for response with timeout
-  retry:
-    FD_ZERO(&readfds);
-    FD_SET(global_state.oxmem_info.sockfd, &readfds);
-    tv.tv_sec = RESPONSE_TIMEOUT_SEC;
-    tv.tv_usec = 0;
 
-    ret =
-	select(global_state.oxmem_info.sockfd + 1, &readfds, NULL, NULL,
-	       &tv);
-    if (ret <= 0) {
-	if (ret == 0)
-	    fprintf(stderr, "Timeout waiting for OmniXtend response\n");
-	else
-	    perror("select failed");
-	return -ETIMEDOUT;
+    if (expect_data) {
+	// Wait for response
+	sem_wait(&sem);
+
+	// Parse response
+	packet_to_ox_struct(recv_buffer, recv_size, recv_ox);
+
+	pthread_mutex_lock(&credit_lock);
+	global_state.credit_in_use[CHANNEL_D - 1] +=
+	    get_used_credit(recv_ox, CHANNEL_D);
+	pthread_mutex_unlock(&credit_lock);
     }
-    // Receive response
-    recv_size =
-	recv(global_state.oxmem_info.sockfd, recv_buffer, BUFFER_SIZE, 0);
-    if (recv_size < 0) {
-	perror("recv failed");
-	return -EIO;
-    }
-    // Check ethertype
-    struct ethhdr *etherHeader = (struct ethhdr *) recv_buffer;
-    if (etherHeader->h_proto != OX_ETHERTYPE) {
-	fprintf(stderr, "Received non-OmniXtend packet\n");
-//        return -EIO;
-	goto retry;
-    }
-    // Parse response
-    packet_to_ox_struct(recv_buffer, recv_size, recv_ox);
-
-    // Update expected sequence number
-    update_seq_num_expected(global_state.oxmem_info.connection_id,
-			    recv_ox);
-
-    if (expect_data == 1 && recv_ox->tl_msg_mask == 0)
-	goto retry;
-
-    global_state.credit_in_use[CHANNEL_D - 1] +=
-	get_used_credit(recv_ox, CHANNEL_D);
+    // Free the source slot
+    free_send_ox_list(source);
+    sem_destroy(&sem);
 
     return 0;
+}
+
+
+void *recv_thread(void *arg)
+{
+    char recv_buffer[BUFFER_SIZE];
+    int recv_size;
+    struct ox_packet_struct recv_ox;
+    struct tl_msg_header_chan_AD tl_msg_header;
+    uint64_t be64_temp;
+    int source;
+
+    (void) arg;			// Unused parameter
+
+    printf("Receive thread started\n");
+
+    while (!shutdown_requested) {
+	// Blocking receive
+	recv_size = recv(global_state.oxmem_info.sockfd, recv_buffer,
+			 BUFFER_SIZE, 0);
+
+	if (recv_size < 0) {
+	    if (shutdown_requested)
+		break;
+	    perror("recv failed");
+	    continue;
+	}
+	// Check ethertype
+	struct ethhdr *etherHeader = (struct ethhdr *) recv_buffer;
+	if (etherHeader->h_proto != OX_ETHERTYPE) {
+	    // Not an OmniXtend packet, ignore
+	    continue;
+	}
+	// Parse response packet
+	packet_to_ox_struct(recv_buffer, recv_size, &recv_ox);
+
+	// Update expected sequence number
+	update_seq_num_expected(global_state.oxmem_info.connection_id,
+				&recv_ox);
+
+	// Update credits
+	pthread_mutex_lock(&credit_lock);
+	global_state.credit_in_use[CHANNEL_D - 1] +=
+	    get_used_credit(&recv_ox, CHANNEL_D);
+	pthread_mutex_unlock(&credit_lock);
+
+	// Extract source field from TileLink message to match request
+	if (recv_ox.tl_msg_mask != 0) {
+	    // Find first valid flit
+	    int i;
+	    for (i = 0; i < 64; i++) {
+		if ((recv_ox.tl_msg_mask >> i) & 0x1)
+		    break;
+	    }
+
+	    if (i < 64) {
+		// Extract TileLink header
+		be64_temp = be64toh(recv_ox.flits[i]);
+		memcpy(&tl_msg_header, &be64_temp, sizeof(uint64_t));
+		source = tl_msg_header.source;
+
+		// Match and signal waiting thread
+		pthread_mutex_lock(&send_ox_list_lock);
+		if (source >= 0 && source < MAX_SEND_OX_LIST &&
+		    send_ox_list[source].sem != NULL) {
+
+		    // Copy response data
+		    memcpy(send_ox_list[source].recv_buffer, recv_buffer,
+			   recv_size);
+		    *send_ox_list[source].recv_size = recv_size;
+
+		    // Signal the waiting thread
+		    sem_post(send_ox_list[source].sem);
+		}
+		pthread_mutex_unlock(&send_ox_list_lock);
+	    }
+	}
+    }
+
+    printf("Receive thread exiting\n");
+    return NULL;
 }
 
 /**
@@ -380,16 +512,16 @@ static int oxmem_write_blocking(const char *buf, size_t size, off_t offset,
  */
 void *nbd_do_it_thread(void *arg)
 {
-    struct oxmem_bdev *bdev = (struct oxmem_bdev *)arg;
+    struct oxmem_bdev *bdev = (struct oxmem_bdev *) arg;
 
     printf("NBD_DO_IT thread started for %s\n", bdev->device_path);
 
     // This blocks until NBD_DISCONNECT is called
     if (ioctl(bdev->nbd_fd, NBD_DO_IT) < 0) {
-        if (!shutdown_requested) {
-            fprintf(stderr, "NBD_DO_IT failed for %s: %s\n",
-                    bdev->device_path, strerror(errno));
-        }
+	if (!shutdown_requested) {
+	    fprintf(stderr, "NBD_DO_IT failed for %s: %s\n",
+		    bdev->device_path, strerror(errno));
+	}
     }
 
     printf("NBD_DO_IT thread exiting for %s\n", bdev->device_path);
@@ -687,6 +819,9 @@ int main(int argc, char *argv[])
     // Initialize global state
     memset(&global_state, 0, sizeof(global_state));
     global_state.num_devices = num_devices;
+
+    // Initialize send_ox_list array
+    memset(send_ox_list, 0, sizeof(send_ox_list));
     strncpy(global_state.oxmem_info.netdev, netdev,
 	    sizeof(global_state.oxmem_info.netdev) - 1);
     global_state.oxmem_info.netdev_id = if_nametoindex(netdev);
@@ -757,6 +892,13 @@ int main(int argc, char *argv[])
 	close(global_state.oxmem_info.sockfd);
 	return 1;
     }
+    // Start receive thread
+    pthread_t recv_tid;
+    if (pthread_create(&recv_tid, NULL, recv_thread, NULL) != 0) {
+	perror("Failed to create receive thread");
+	close(global_state.oxmem_info.sockfd);
+	return 1;
+    }
     // Open connection (simplified - blocking)
     printf("Establishing OmniXtend connection...\n");
 
@@ -767,14 +909,14 @@ int main(int argc, char *argv[])
 				    &send_ox);
 
     send_ox.tloe_hdr.chan = CHANNEL_A;
-    send_ox.tloe_hdr.credit = 9;
+    send_ox.tloe_hdr.credit = DEFAULT_CREDIT;
     // Send on Channel A (blocking)
     send_and_wait_response(&send_ox, &recv_ox, 0);
 
     // Send on Channel D (blocking)
     send_ox.tloe_hdr.msg_type = NORMAL;
     send_ox.tloe_hdr.chan = CHANNEL_D;
-    send_ox.tloe_hdr.credit = 9;
+    send_ox.tloe_hdr.credit = DEFAULT_CREDIT;
     send_and_wait_response(&send_ox, &recv_ox, 0);
 
     printf("Connection established (ID: %d)\n",
@@ -838,7 +980,8 @@ int main(int argc, char *argv[])
 	if (pthread_create
 	    (&nbd_threads[i], NULL, nbd_server_thread,
 	     &global_state.bdevs[i]) != 0) {
-	    fprintf(stderr, "Failed to create NBD server thread for device %d\n",
+	    fprintf(stderr,
+		    "Failed to create NBD server thread for device %d\n",
 		    i);
 	    cleanup_and_exit();
 	    return 1;
@@ -852,7 +995,8 @@ int main(int argc, char *argv[])
 	if (pthread_create
 	    (&nbd_do_it_threads[i], NULL, nbd_do_it_thread,
 	     &global_state.bdevs[i]) != 0) {
-	    fprintf(stderr, "Failed to create NBD_DO_IT thread for device %d\n",
+	    fprintf(stderr,
+		    "Failed to create NBD_DO_IT thread for device %d\n",
 		    i);
 	    cleanup_and_exit();
 	    return 1;

@@ -179,6 +179,7 @@ struct ox_request {
 #define FUSE_DIRECT_IO	1	//1=mmap MAP_PRIVATE only, 0=mmap MAP_SHARED possible
 #define OX_REQUEST_LIST_LENGTH 1
 #define READ_WRITE_UNIT 1024	//max read/write data size for a request
+#define DEFAULT_CREDIT 12 //2^10 x 8byte
 
 #if 0
 #define PRINT_LINE(fmt, args...) printf("%s %d - " fmt, __FUNCTION__, __LINE__, ##args)
