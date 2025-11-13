@@ -9,47 +9,11 @@
 
 #include "lib-ox-packet.h"
 
+// Logging infrastructure
+#define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) // Compile-time disabled
+
 static struct ox_connection ox_conn_list[NUM_CONNECTION];
-
-/**
- * @brief Print payload in Hex format
- */
-void print_payload(char *data, int size)
-{
-    int i, j;
-
-    for (i = 0; i < size; i++) {
-	if (i != 0 && i % 16 == 0) {
-	    printf("\t");
-	    for (j = i - 16; j < i; j++) {
-		if (data[j] >= 32 && data[j] < 128)
-		    PRINT_LINE("%c", (unsigned char) data[j]);
-		else
-		    PRINT_LINE(".");
-	    }
-	    PRINT_LINE("\n");
-	}
-
-	if ((i % 8) == 0 && (i % 16) != 0)
-	    PRINT_LINE(" ");
-	PRINT_LINE(" %02X", (unsigned char) data[i]);	// print DATA
-
-	if (i == size - 1) {
-	    for (j = 0; j < (15 - (i % 16)); j++)
-		PRINT_LINE("   ");
-
-	    PRINT_LINE("\t");
-
-	    for (j = (i - (i % 16)); j <= i; j++) {
-		if (data[j] >= 32 && data[j] < 128)
-		    PRINT_LINE("%c", (unsigned char) data[j]);
-		else
-		    PRINT_LINE(".");
-	    }
-	    PRINT_LINE("\n");
-	}
-    }
-}
 
 /**
  * @brief Return connection ID with a matching source mac address 
@@ -73,8 +37,8 @@ int get_connection(struct ox_packet_struct *ox_p)
 	    return i;
 	}
     }
-    printf("Connection Error! - MAC %lx is not found in list.\n",
-	   be64toh(ox_p->eth_hdr.src_mac_addr) >> 16);
+    LOG_ERROR("Connection Error! - MAC %lx is not found in list",
+	      be64toh(ox_p->eth_hdr.src_mac_addr) >> 16);
 
     return -1;
 }
@@ -130,16 +94,6 @@ add_new_connection(uint64_t your_mac_addr, uint64_t my_mac_addr,
     return -1;
 }
 
-/*
-int atomic_get_seq_num(int connection_id)
-{
-	int seq_num;
-	seq_num = ox_conn_list[connection_id].my_seq_num;
-	PRINT_LINE("connection_id=%d seq_num=%d\n", connection_id, seq_num);
-	ox_conn_list[connection_id].my_seq_num++;
-	return seq_num;
-}
-*/
 void
 make_response_packet_template(int connection_id,
 			      struct ox_packet_struct *recv_ox_p,
@@ -152,7 +106,6 @@ make_response_packet_template(int connection_id,
     send_ox_p->tloe_hdr.chan = recv_ox_p->tloe_hdr.chan;
     send_ox_p->tloe_hdr.seq_num_ack = recv_ox_p->tloe_hdr.seq_num;
     send_ox_p->tloe_hdr.credit = ox_conn_list[connection_id].credit;
-//    send_ox_p->tloe_hdr.seq_num = ox_conn_list[connection_id].my_seq_num++;
     send_ox_p->tloe_hdr.ack = 1;
     send_ox_p->tloe_hdr.msg_type = NORMAL;	// Normal type
     send_ox_p->tloe_hdr.vc = recv_ox_p->tloe_hdr.vc;
@@ -174,7 +127,7 @@ uint64_t get_mac_addr_from_devname(int sockfd, char *netdev)
 	for (i = 0; i < 6; i++) {
 	    my_mac += ((uint64_t) mac[i]) << (i * 8);
 	}
-	PRINT_LINE("netdev=%s mac = %lx\n", netdev, my_mac);
+	LOG_DEBUG("netdev=%s mac = %lx", netdev, my_mac);
     }
 
     return my_mac;
@@ -196,7 +149,7 @@ int set_seq_num_to_ox_packet(int connection_id, struct ox_packet_struct *send_ox
 
 int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_p)
 {
-	PRINT_LINE("recv seq_num  = %x\n", recv_ox_p->tloe_hdr.seq_num);
+	LOG_DEBUG("recv seq_num  = %x", recv_ox_p->tloe_hdr.seq_num);
 	pthread_mutex_lock(&seq_num_lock);
 	if ( recv_ox_p->tloe_hdr.seq_num >= ox_conn_list[connection_id].your_seq_num_expected ) {
 	    ox_conn_list[connection_id].your_seq_num_expected = recv_ox_p->tloe_hdr.seq_num + 1;
@@ -230,15 +183,14 @@ make_open_connection_packet(int sockfd, char *netdev, uint64_t dst_mac,
     int msg_type;
 
     my_mac = get_mac_addr_from_devname(sockfd, netdev);
-    PRINT_LINE("netdev=%s my_mac=%lx dst_mac = %lx\n", netdev, my_mac,
-	      dst_mac);
+    LOG_DEBUG("netdev=%s my_mac=%lx dst_mac = %lx", netdev, my_mac, dst_mac);
 
     bzero(send_ox_p, sizeof(struct ox_packet_struct));
     bzero(&recv_ox_p, sizeof(struct ox_packet_struct));
 
     if (connection_id = add_new_connection(dst_mac, my_mac, 0x3FFFFF) < 0) {
 	// No slot
-	PRINT_LINE("Error - There is no room for new connection.\n");
+	LOG_ERROR("No room for new connection");
 	return -1;
     }
     // make recv_ox_p from scratch
@@ -280,7 +232,6 @@ make_close_connection_packet(int connection_id,
     send_ox_p->tloe_hdr.seq_num_ack =
 	ox_conn_list[connection_id].your_seq_num_expected - 1;
     send_ox_p->tloe_hdr.credit = 0;
-//    send_ox_p->tloe_hdr.seq_num = ox_conn_list[connection_id].my_seq_num++;
     send_ox_p->tloe_hdr.ack = 1;
     send_ox_p->tloe_hdr.msg_type = CLOSE_CONN;	// Close Connection
     send_ox_p->tloe_hdr.vc = 0;
@@ -301,7 +252,7 @@ int make_ack_packet(int connection_id,
 	ox_conn_list[connection_id].my_mac_addr;
     send_ox_p->eth_hdr.eth_type = OX_ETHERTYPE;
 
-    send_ox_p->tloe_hdr.chan = CHANNEL_D;	//ack for channel D packet
+    send_ox_p->tloe_hdr.chan = 0;
     send_ox_p->tloe_hdr.seq_num_ack = 
 	ox_conn_list[connection_id].your_seq_num_expected - 1;
     send_ox_p->tloe_hdr.credit = 0;
@@ -322,8 +273,8 @@ int make_ack_packet(int connection_id,
  */
 int
 make_get_op_packet(int connection_id, size_t size, off_t offset,
-		   struct ox_packet_struct *send_ox_p,
-		   uint64_t * send_flits)
+		   struct ox_packet_struct *send_ox_p/*,
+		   uint64_t * send_flits*/)
 {
     struct tl_msg_header_chan_AD tl_msg_header;
     uint64_t be64_temp;
@@ -335,14 +286,12 @@ make_get_op_packet(int connection_id, size_t size, off_t offset,
     }
 
     if (size_bit > 10) {
-	PRINT_LINE("size=%lu is not supported. size must be 2^n (n=3~10)\n",
-		  size);
+	LOG_ERROR("size=%lu is not supported. size must be 2^n (n=3~10)", size);
 	return -1;
     }
 
     bzero(&tl_msg_header, sizeof(struct tl_msg_header_chan_AD));
     bzero(send_ox_p, sizeof(struct ox_packet_struct));
-    send_ox_p->flits = send_flits;
 
     // Make a tilelink message and add as a flit
     tl_msg_header.source = 0;
@@ -367,7 +316,6 @@ make_get_op_packet(int connection_id, size_t size, off_t offset,
     send_ox_p->tloe_hdr.seq_num_ack =
 	ox_conn_list[connection_id].your_seq_num_expected - 1;
     send_ox_p->tloe_hdr.credit = 0;
-//    send_ox_p->tloe_hdr.seq_num = ox_conn_list[connection_id].my_seq_num++;
     send_ox_p->tloe_hdr.ack = 1;
     send_ox_p->tloe_hdr.msg_type = NORMAL;
     send_ox_p->tloe_hdr.vc = 0;
@@ -382,8 +330,8 @@ make_get_op_packet(int connection_id, size_t size, off_t offset,
  */
 int
 make_putfull_op_packet(int connection_id, const char *buf, size_t size,
-		       off_t offset, struct ox_packet_struct *send_ox_p,
-		       uint64_t * send_flits)
+		       off_t offset, struct ox_packet_struct *send_ox_p/*,
+		       uint64_t * send_flits*/)
 {
     struct tl_msg_header_chan_AD tl_msg_header;
     uint64_t be64_temp;
@@ -395,14 +343,12 @@ make_putfull_op_packet(int connection_id, const char *buf, size_t size,
     }
 
     if (size_bit > 10) {
-	PRINT_LINE("size=%lu is not supported. size must be 2^n (n=0~10)\n",
-		  size);
+	LOG_ERROR("size=%lu is not supported. size must be 2^n (n=0~10)", size);
 	return -1;
     }
 
     bzero(&tl_msg_header, sizeof(struct tl_msg_header_chan_AD));
     bzero(send_ox_p, sizeof(struct ox_packet_struct));
-    send_ox_p->flits = send_flits;
 
     // Make a tilelink message and add as a flit
     tl_msg_header.source = 0;
@@ -430,7 +376,6 @@ make_putfull_op_packet(int connection_id, const char *buf, size_t size,
     send_ox_p->tloe_hdr.seq_num_ack =
 	ox_conn_list[connection_id].your_seq_num_expected - 1;
     send_ox_p->tloe_hdr.credit = 0;
-//    send_ox_p->tloe_hdr.seq_num = ox_conn_list[connection_id].my_seq_num++;
     send_ox_p->tloe_hdr.ack = 1;
     send_ox_p->tloe_hdr.msg_type = NORMAL;
     send_ox_p->tloe_hdr.vc = 0;
@@ -473,10 +418,10 @@ ox_struct_to_packet(struct ox_packet_struct *ox_p, char *send_buffer,
     memcpy(send_buffer + offset, &be64_temp, sizeof(uint64_t));
     offset += sizeof(uint64_t);
 
-    if (ox_p->flit_cnt > 0 && ox_p->flits != NULL) {
+    if (ox_p->flit_cnt > 0 /*&& ox_p->flits != NULL*/) {
 	memcpy(send_buffer + offset, ox_p->flits,
 	       sizeof(uint64_t) * ox_p->flit_cnt);
-	PRINT_LINE("ox_p->flits[0]=0x%lx\n", ox_p->flits[0]);
+	LOG_DEBUG("ox_p->flits[0]=0x%lx", ox_p->flits[0]);
     }
     // TLoE frame mask
     mask = htobe64(ox_p->tl_msg_mask);
@@ -526,10 +471,8 @@ packet_to_ox_struct(char *recv_buffer, int recv_size,
 	 sizeof(uint64_t) /* mask */ ) / sizeof(uint64_t);
     ox_p->flit_cnt = tl_msg_full_count_by_8bytes;
 
-    // just pass the pointer of receive buffer
-    ox_p->flits =
-	(uint64_t *) (recv_buffer + sizeof(struct eth_header) +
-		      sizeof(struct tloe_header));
+    // copy flits
+    memcpy(ox_p->flits, (uint64_t *) (recv_buffer + sizeof(struct eth_header) + sizeof(struct tloe_header)), ox_p->flit_cnt * 8);
 
     // TLoE frame mask (8 bytes)
     memcpy(&tl_msg_mask, recv_buffer + recv_size - sizeof(tl_msg_mask),

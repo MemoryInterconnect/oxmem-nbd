@@ -7,6 +7,7 @@
 #define NUM_CONNECTION	4	// Maximum number of connection
 #define MEM_SIZE		(8ULL * 1024 * 1024 * 1024)	// 8GB
 #define BUFFER_SIZE	2048
+#define MAX_FLIT_NUM	(BUFFER_SIZE/8)	//1 flit = 8 bytes
 
 
 #define OX_START_ADDR	0x0
@@ -139,7 +140,8 @@ struct ox_packet_struct {
     struct tloe_header tloe_hdr;
     uint64_t tl_msg_mask;
     uint32_t flit_cnt;
-    uint64_t *flits;
+    uint64_t flits[MAX_FLIT_NUM];
+//    uint64_t *flits;
 };
 
 struct oxmem_info_struct {
@@ -176,69 +178,35 @@ struct ox_request {
 //    int result; //1=Success, 0=Fail
 };
 
-#define FUSE_DIRECT_IO	1	//1=mmap MAP_PRIVATE only, 0=mmap MAP_SHARED possible
+#define FUSE_DIRECT_IO 1	// 1=mmap MAP_PRIVATE only, 0=mmap MAP_SHARED possible
 #define OX_REQUEST_LIST_LENGTH 1
-#define READ_WRITE_UNIT 1024	//max read/write data size for a request
-#define DEFAULT_CREDIT 12 //2^10 x 8byte
+#define READ_WRITE_UNIT 1024	// max read/write data size for a request
+#define DEFAULT_CREDIT 12	// 2^10 x 8byte
 
-#if 0
-#define PRINT_LINE(fmt, args...) printf("%s %d - " fmt, __FUNCTION__, __LINE__, ##args)
-#else
-#define PRINT_LINE(fmt, args...)
-#endif
-
-#if 1
-#define PRINT_LINE1(fmt, args...) printf("%s %d - " fmt, __FUNCTION__, __LINE__, ##args)
-#else
-#define PRINT_LINE1(fmt, args...)
-#endif
-
-
-static const char *oxmem_log_path = "/home/swsok/oxmem.log";
-
-/*
- * #define PRINT_LINE(...) do {\ char buf[4096];\ int logfd;\ sprintf(buf,
- * __VA_ARGS__);\ logfd = open(oxmem_log_path, O_RDWR|O_APPEND|O_CREAT,
- * 0644);\ write(logfd, buf, strlen(buf));\ close(logfd);\ } while (0) 
- */
-
-
-// functions
-//void build_ethernet_header(struct ox_packet_struct *,
-//			   struct ox_packet_struct *);
-//void build_tLoE_frame_header(int, struct ox_packet_struct *,
-//			     struct ox_packet_struct *);
+// Function declarations
 int ox_struct_to_packet(struct ox_packet_struct *, char *, int *);
 int packet_to_ox_struct(char *, int, struct ox_packet_struct *);
-void make_response_packet_template(int connection_id, struct ox_packet_struct
-				   *recv_ox_p, struct ox_packet_struct
-				   *send_ox_p);
+void make_response_packet_template(int connection_id,
+				   struct ox_packet_struct *recv_ox_p,
+				   struct ox_packet_struct *send_ox_p);
 int get_connection(struct ox_packet_struct *);
 int delete_connection(int);
 int create_new_connection(struct ox_packet_struct *);
-//int send_ack(int, int, struct ox_packet_struct *);
-//int send_close_connection(int, int, struct ox_packet_struct *);
-int make_open_connection_packet(int sockfd, char *netdev, uint64_t dst_mac, struct ox_packet_struct
-				*send_ox_p);
-int make_close_connection_packet(int connection_id, struct ox_packet_struct
-				 *send_ox_p);
-int make_get_op_packet(int connection_id, size_t size,
-		       off_t offset,
-		       struct ox_packet_struct *send_ox_p,
-		       uint64_t * send_flits);
+int make_open_connection_packet(int sockfd, char *netdev, uint64_t dst_mac,
+				struct ox_packet_struct *send_ox_p);
+int make_close_connection_packet(int connection_id,
+				 struct ox_packet_struct *send_ox_p);
+int make_get_op_packet(int connection_id, size_t size, off_t offset,
+		       struct ox_packet_struct *send_ox_p);
 int make_putfull_op_packet(int connection_id, const char *buf,
 			   size_t size, off_t offset,
-			   struct ox_packet_struct *send_ox_p,
-			   uint64_t * send_flits);
-int make_ack_packet(int connection_id, struct ox_packet_struct *recv_ox_p, struct ox_packet_struct *send_ox_p);
-//void *oxmem_recv_thread(void *arg);
-//void print_payload(char *data, int size);
-//int get_ox_msg_type(struct ox_packet_struct *ox_p);
-//int init_ox_request_list(void);
-//void destroy_ox_request_list(void);
-int set_seq_num_to_ox_packet(int connection_id, struct ox_packet_struct *send_ox_p);
-int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_p);
-//int atomic_get_seq_num(int connection_id);
+			   struct ox_packet_struct *send_ox_p);
+int make_ack_packet(int connection_id, struct ox_packet_struct *recv_ox_p,
+		    struct ox_packet_struct *send_ox_p);
+int set_seq_num_to_ox_packet(int connection_id,
+			     struct ox_packet_struct *send_ox_p);
+int update_seq_num_expected(int connection_id,
+			    struct ox_packet_struct *recv_ox_p);
 int get_seq_num_expected(int connection_id);
 
 #endif				/* __OMEM_H__ */
