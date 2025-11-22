@@ -177,8 +177,8 @@ struct ox_request {
 };
 
 #define FUSE_DIRECT_IO	1	//1=mmap MAP_PRIVATE only, 0=mmap MAP_SHARED possible
-#define OX_REQUEST_LIST_LENGTH 1
-#define READ_WRITE_UNIT 1024	//max read/write data size for a request
+//#define OX_REQUEST_LIST_LENGTH 1
+//#define READ_WRITE_UNIT 1024	//max read/write data size for a request
 #define DEFAULT_CREDIT 12 //2^10 x 8byte
 
 #if 0
@@ -240,5 +240,18 @@ int set_seq_num_to_ox_packet(int connection_id, struct ox_packet_struct *send_ox
 int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_p);
 //int atomic_get_seq_num(int connection_id);
 int get_seq_num_expected(int connection_id);
+
+
+
+
+
+
+
+
+
+void setup_send_ox_eth_hdr(int connection_id, struct ox_packet_struct * send_ox_p);
+uint64_t get_mac_addr_from_devname(int sockfd, char *netdev);
+
+int add_new_connection(uint64_t your_mac_addr, uint64_t my_mac_addr, uint32_t initial_seq_num);
 
 #endif				/* __OMEM_H__ */

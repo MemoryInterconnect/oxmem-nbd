@@ -2,10 +2,10 @@
 default: all ;
 
 # Build only oxmem-nbd by default
-all: oxmem-nbd
+all: oxmem-nbd make-increment-file
 
 oxmem-nbd: oxmem-nbd.c lib-ox-packet.c lib-queue.c Makefile lib-ox-packet.h lib-queue.h
-	gcc -D_FILE_OFFSET_BITS=64 -o $@ oxmem-nbd.c lib-ox-packet.c lib-queue.c -lpthread
+	gcc -g -o $@ oxmem-nbd.c lib-ox-packet.c lib-queue.c -pthread
 	sudo setcap cap_net_raw+ep $@
 
 make-increment-file: make-increment-file.c Makefile

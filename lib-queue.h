@@ -1,9 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 // Define the structure for a node in the linked list
 typedef struct Node {
-    int data;
+    uint64_t data;
     struct Node* next;
 } Node;
 
@@ -17,17 +18,17 @@ typedef struct Queue {
 void initQueue(Queue* q); 
 
 // Function to check if the queue is empty
-int isEmpty(Queue* q);
+uint64_t isEmpty(Queue* q);
 
 // Function to add an element to the queue
-void enqueue(Queue* q, int data);
+void enqueue(Queue* q, uint64_t data);
 
 // Function to remove first element from the queue
-int dequeue(Queue* q);
+uint64_t dequeue(Queue* q);
 
 // Function to remove matched element from the queue
-int dequeue_an_entry(Queue* q, int data);
+uint64_t dequeue_an_entry(Queue* q, uint64_t data);
 
-// Function to print the queue
-void printQueue(Queue* q);
+// Function to pruint64_t the queue
+void print_tQueue(Queue* q);
 

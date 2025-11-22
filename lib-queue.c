@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <pthread.h>
 
 // Define the structure for a node in the linked list
 typedef struct Node {
-    int data;
+    uint64_t data;
     struct Node* next;
 } Node;
 
@@ -13,8 +15,10 @@ typedef struct Queue {
     Node* rear;
 } Queue;
 
+static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
+
 // Function to create a new node with given data
-Node* createNode(int data) {
+Node* createNode(uint64_t data) {
     Node* newNode = (Node*)malloc(sizeof(Node));
     if (!newNode) return NULL;
     
@@ -34,45 +38,56 @@ int isEmpty(Queue* q) {
 }
 
 // Function to add an element to the queue
-void enqueue(Queue* q, int data) {
+void enqueue(Queue* q, uint64_t data) {
     Node* newNode = createNode(data);
     if (!newNode) {
         printf("Memory allocation failed!\n");
         return;
     }
-    
+
+    pthread_mutex_lock(&q_lock);
+
     if (isEmpty(q)) {
         q->front = q->rear = newNode;
     } else {
         q->rear->next = newNode;
         q->rear = newNode;
     }
+    pthread_mutex_unlock(&q_lock);
 }
 
 // Function to remove an element from the queue
-int dequeue(Queue* q) {
+uint64_t dequeue(Queue* q) {
+    pthread_mutex_lock(&q_lock);
     if (isEmpty(q)) {
+    pthread_mutex_unlock(&q_lock);
 //        printf("Queue is empty!\n");
-        return -1;
+        return 0;
     }
     
+
     Node* temp = q->front;
-    int data = temp->data;
+
+    uint64_t data = temp->data;
+
     q->front = q->front->next;
     
     if (q->front == NULL) {
         q->rear = NULL;
     }
+    pthread_mutex_unlock(&q_lock);
     
     free(temp);
     return data;
 }
 
-int dequeue_an_entry(Queue* q, int data) {
+uint64_t dequeue_an_entry(Queue* q, uint64_t data) {
     Node * prev = NULL;
     Node * temp = NULL;
 
+    pthread_mutex_lock(&q_lock);
     if (isEmpty(q)) {
+    pthread_mutex_unlock(&q_lock);
 //        printf("Queue is empty!\n");
         return -1;
     }
@@ -101,6 +116,7 @@ int dequeue_an_entry(Queue* q, int data) {
     if (q->front == NULL) {
         q->rear = NULL;
     }
+    pthread_mutex_unlock(&q_lock);
     
     free(temp);
     return data;
@@ -111,7 +127,7 @@ int dequeue_an_entry(Queue* q, int data) {
 void printQueue(Queue* q) {
     Node* temp = q->front;
     while (temp) {
-        printf("%d ", temp->data);
+        printf("%lu ", temp->data);
         temp = temp->next;
     }
     printf("\n");
