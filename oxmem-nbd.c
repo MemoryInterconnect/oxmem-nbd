@@ -42,8 +42,8 @@
 #define MAX_TL_MSG_LIST 1000
 
 //MAX_INFLIGHT_READS>1 makes some receiving packets are dropped or its head part is missing.
-#define MAX_INFLIGHT_READS 1
-#define MAX_INFLIGHT_WRITES 1024
+#define MAX_INFLIGHT_READS 2
+#define MAX_INFLIGHT_WRITES 4
 
 // Per-NBD device state
 struct oxmem_bdev
