@@ -27,7 +27,7 @@
 // Logging infrastructure
 #define LOG_INFO(fmt, ...) printf("[INFO] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
-#if 0
+#if 1
 #define LOG_DEBUG(fmt, ...) printf("[DEBUG] %s %d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
 #else
 #define LOG_DEBUG(fmt, ...) 
@@ -35,15 +35,17 @@
 #define LOG_THREAD(name, fmt, ...) printf("[%s] " fmt "\n", name, ##__VA_ARGS__)
 
 // NBD device path
-#define NBD_DEVICE "/dev/nbd0"
+//#define NBD_DEVICE "/dev/nbd0"
 #define READ_WRITE_UNIT 1024
 #define RESPONSE_TIMEOUT_SEC 10
 #define MAX_NBD_DEVICES 16
 #define MAX_TL_MSG_LIST 1000
 
 //MAX_INFLIGHT_READS>1 makes some receiving packets are dropped or its head part is missing.
-#define MAX_INFLIGHT_READS 2
-#define MAX_INFLIGHT_WRITES 4
+#define READ_COALESCE_COUNT 32
+#define MAX_INFLIGHT_READS 32
+#define MAX_INFLIGHT_WRITES 8
+#define TIMEOUT 10000000 // in ns, 1000000 == 1 ms
 
 // Per-NBD device state
 struct oxmem_bdev
@@ -75,6 +77,7 @@ struct oxmem_global
 struct tl_flit
 {
   struct tl_msg_header_chan_AD hdr;
+  uint64_t addr;
   uint64_t flits[READ_WRITE_UNIT / sizeof (uint64_t) + 2];
 };
 
@@ -274,9 +277,9 @@ update_send_ox_credit (struct ox_packet_struct *send_ox)
 int
 send_ox_packet (struct ox_packet_struct *send_ox)
 {
-  char send_buffer[BUFFER_SIZE];
-  int send_size;
-  int ret;
+//  char send_buffer[BUFFER_SIZE];
+//  int send_size;
+//  int ret;
   struct ox_packet_struct *send_ox_buffer;
 
   send_ox_buffer = malloc (sizeof (struct ox_packet_struct));
@@ -429,8 +432,9 @@ oxmem_read_blocking (char *buf, size_t size, off_t offset,
   size_t chunk_offsets[1024];
   int send_idx = 0;		// Next position to send
   int wait_idx = 0;		// Next position to wait for
+  int coalesce_count = 0;
 
-  LOG_DEBUG ("READ offset=%lx size=%ld", offset, size);
+//  LOG_INFO ("READ offset=%lx size=%ld", offset, size);
 
   // Bounds check
   if (offset + size > bdev->device_size)
@@ -477,6 +481,7 @@ oxmem_read_blocking (char *buf, size_t size, off_t offset,
 	  tl_msg_list[source].sent_tl.hdr.size = i;
 	  tl_msg_list[source].sent_tl.hdr.opcode = A_GET_OPCODE;
 	  tl_msg_list[source].sent_tl.hdr.chan = CHANNEL_A;
+      tl_msg_list[source].sent_tl.addr = absolute_offset + bytes_processed;
 
 	  //setup flits of send_ox
 	  memcpy (&be64_temp, &tl_msg_list[source].sent_tl.hdr,
@@ -484,16 +489,31 @@ oxmem_read_blocking (char *buf, size_t size, off_t offset,
 	  tl_msg_list[source].sent_tl.flits[0] = be64toh (be64_temp);
 
 	  //setup address
-	  be64_temp = absolute_offset + bytes_processed;
-	  tl_msg_list[source].sent_tl.flits[1] = be64toh (be64_temp);
-
-	  send_ox.tl_msg_mask = 0x1;
-	  send_ox.flit_cnt = 2;
-	  send_ox.flits = tl_msg_list[source].sent_tl.flits;
-	  tl_msg_list[source].tl_status = TL_SENT;
+//	  be64_temp = absolute_offset + bytes_processed;
+//	  tl_msg_list[source].sent_tl.flits[1] = be64toh (be64_temp);
+      tl_msg_list[source].sent_tl.flits[1] = be64toh (tl_msg_list[source].sent_tl.addr);
+      
 
 	  sem_init (&tl_msg_list[source].sem, 0, 0);
+
+/*	  send_ox.tl_msg_mask = 0x1;
+	  send_ox.flit_cnt = 2;
+	  send_ox.flits = tl_msg_list[source].sent_tl.flits;
+
 	  send_ox_packet (&send_ox);
+*/
+
+	  tl_msg_list[source].tl_status = TL_SENT;
+      if ( send_ox.flits == NULL ) {
+//        send_ox.flit_cnt = 0;
+        send_ox.flits = tl_msg_list[source].sent_tl.flits;
+      } else {
+        send_ox.flits[coalesce_count*2] = tl_msg_list[source].sent_tl.flits[0];
+        send_ox.flits[coalesce_count*2+1] = tl_msg_list[source].sent_tl.flits[1];
+      }
+
+      send_ox.tl_msg_mask |= 1UL<<(coalesce_count*2);
+	  send_ox.flit_cnt += 2;
 
 	  // Track chunk information for later data copy
 	  chunk_sizes[send_idx] = chunk_size;
@@ -501,6 +521,20 @@ oxmem_read_blocking (char *buf, size_t size, off_t offset,
 
 	  bytes_processed += chunk_size;
 	  send_idx++;
+
+//LOG_DEBUG("coalesce_count = %d", coalesce_count);
+      coalesce_count ++;
+      if ( coalesce_count >= READ_COALESCE_COUNT 
+        || coalesce_count >= MAX_INFLIGHT_READS 
+        || bytes_processed >= size ) {
+//LOG_DEBUG("coalesce_count = %d", coalesce_count);
+
+        send_ox_packet (&send_ox);
+        send_ox.flits = NULL;
+        send_ox.flit_cnt=0;
+        send_ox.tl_msg_mask = 0;
+        coalesce_count = 0;
+      }
 	}
 
       // Wait for oldest in-flight request to complete
@@ -509,15 +543,17 @@ oxmem_read_blocking (char *buf, size_t size, off_t offset,
 	  source = source_list[wait_idx];
 
 	  clock_gettime (CLOCK_REALTIME, &timeout);
-	  timeout.tv_sec += 1;
+	  timeout.tv_nsec += TIMEOUT;  // 1ms
+	  if (timeout.tv_nsec >= 1000000000) {
+	    timeout.tv_nsec -= 1000000000;
+	    timeout.tv_sec += 1;
+	  }
 
 	  ret = sem_timedwait (&tl_msg_list[source].sem, &timeout);
 	  if (ret)
 	    {
-	      LOG_DEBUG ("READ sem_timedwait TIMEOUT source=%d offset=%lx - retransmitting",
+	      LOG_INFO ("READ sem_timedwait TIMEOUT source=%d offset=%lx - retransmitting",
 	                 source, absolute_offset+chunk_offsets[wait_idx]);
-
-//signal_handler(1);
 
 	      // Retransmit: Reconstruct send_ox from tl_msg_list[source]
 	      send_ox.tl_msg_mask = 0x1;
@@ -532,11 +568,15 @@ oxmem_read_blocking (char *buf, size_t size, off_t offset,
 	      // Retransmit the packet
 	      send_ox_packet (&send_ox);
 
-	      LOG_DEBUG ("Retransmitted source=%d, waiting again", source);
+	      LOG_INFO ("Retransmitted source=%d, waiting again", source);
 
 	      // Wait again for the retransmitted request
 	      clock_gettime (CLOCK_REALTIME, &timeout);
-	      timeout.tv_sec += 1;
+	      timeout.tv_nsec += TIMEOUT;  // 1ms
+	      if (timeout.tv_nsec >= 1000000000) {
+	        timeout.tv_nsec -= 1000000000;
+	        timeout.tv_sec += 1;
+	      }
 	      ret = sem_timedwait (&tl_msg_list[source].sem, &timeout);
 
 	      if (ret)
@@ -583,7 +623,7 @@ oxmem_write_blocking (const char *buf, size_t size, off_t offset,
   int send_idx = 0;		// Next position to send
   int wait_idx = 0;		// Next position to wait for
 
-  LOG_DEBUG ("WRITE offset=%lx size=%ld", offset, size);
+//  LOG_DEBUG ("WRITE offset=%lx size=%ld", offset, size);
 
   // Bounds check
   if (offset + size > bdev->device_size)
@@ -895,6 +935,8 @@ send_thread (void *arg)
 
       update_send_ox_credit (send_ox);
 
+//if ( send_ox->tl_msg_mask )
+//LOG_DEBUG("send_ox->flit_cnt = %u mask=%lx", send_ox->flit_cnt, send_ox->tl_msg_mask);
       ox_struct_to_packet (send_ox, send_buffer, &send_size);
 
       // Send packet
@@ -953,15 +995,17 @@ post_handler_thread (void *arg)
       packet_to_ox_struct (work_item->recv_buffer, work_item->recv_size,
 			    &recv_ox);
 
-    if ( work_item->recv_size > 70)
+/*    if ( work_item->recv_size > 70)
     LOG_DEBUG ("work_item->recv_size = %d id = %lu", work_item->recv_size, work_item->id);
-
+*/
       // Update expected sequence number (previously lines 867-873)
-      if (0 >
+      if (0 >=
 	  update_seq_num_expected (global_state.oxmem_info.connection_id,
 				   &recv_ox))
 	{
 	  // Obsolete packet - could continue or process anyway
+//	  free (work_item);
+//        continue;
 	}
 
 
@@ -980,7 +1024,8 @@ post_handler_thread (void *arg)
 	}
 
 
-      if (  isEmpty(&q_send) && global_state.my_credit_in_use[CHANNEL_D - 1] > 16 )
+//      if (  isEmpty(&q_send) && global_state.my_credit_in_use[CHANNEL_D - 1] > 16 )
+      if (  isEmpty(&q_send) )
       // Send ACK (previously line 877)
         send_ack ();
 
@@ -1014,7 +1059,7 @@ post_handler_thread (void *arg)
 		  be64_temp = be64toh (recv_ox.flits[i]);
 		  memcpy (&tl_msg_header, &be64_temp, sizeof (uint64_t));
 		  source = tl_msg_header.source;
-		  LOG_DEBUG ("2 source=%d received", source);
+//		  LOG_DEBUG ("2 source=%d received seq_num=%x addr=%lx", source, recv_ox.tloe_hdr.seq_num, tl_msg_list[source].sent_tl.addr);
 
 		  if (source >= MAX_TL_MSG_LIST)
 		    {
@@ -1114,9 +1159,9 @@ recv_thread (void *arg)
 
       work_item->id = recv_id++;
 
-    if ( recv_size > 70)
+/*    if ( recv_size > 70)
 LOG_DEBUG("recv_size = %d id = %lu", recv_size, work_item->id);
-
+*/
       // Copy packet to work item
       memcpy (work_item->recv_buffer, recv_buffer, recv_size);
       work_item->recv_size = recv_size;
