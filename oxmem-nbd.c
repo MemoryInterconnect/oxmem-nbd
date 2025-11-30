@@ -556,7 +556,7 @@ wait_for_response(int source)
         send_ox_packet(send_ox);
 
         retransmit_count ++;
-        LOG_DEBUG("READ Retransmitted source=%d addr=%lx (retry %d) retransmit total =%ld", source, tl_msg_list[source].sent_tl.tl_addr, retry_count, retransmit_count);
+        LOG_INFO("READ Retransmitted source=%d addr=%lx (retry %d) retransmit total =%ld", source, tl_msg_list[source].sent_tl.tl_addr, retry_count, retransmit_count);
 
         set_timeout(&timeout, TIMEOUT_NS*5);
         ret = sem_timedwait(&tl_msg_list[source].sem, &timeout);
