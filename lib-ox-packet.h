@@ -140,6 +140,9 @@ struct ox_packet_struct {
     uint64_t tl_msg_mask;
     uint32_t flit_cnt;
     uint64_t *flits;
+    size_t packet_size;
+    char packet_buffer[BUFFER_SIZE];
+//    uint64_t flits[130];
 };
 
 struct oxmem_info_struct {
@@ -208,8 +211,10 @@ static const char *oxmem_log_path = "/home/swsok/oxmem.log";
 //			   struct ox_packet_struct *);
 //void build_tLoE_frame_header(int, struct ox_packet_struct *,
 //			     struct ox_packet_struct *);
-int ox_struct_to_packet(struct ox_packet_struct *, char *, int *);
-int packet_to_ox_struct(char *, int, struct ox_packet_struct *);
+//int ox_struct_to_packet(struct ox_packet_struct *, char *, int *);
+//int packet_to_ox_struct(char *, int, struct ox_packet_struct *);
+int ox_struct_to_packet(struct ox_packet_struct *);
+int packet_to_ox_struct(struct ox_packet_struct *);
 void make_response_packet_template(int connection_id, struct ox_packet_struct
 				   *recv_ox_p, struct ox_packet_struct
 				   *send_ox_p);

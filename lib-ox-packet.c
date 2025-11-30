@@ -15,13 +15,15 @@ static struct ox_connection ox_conn_list[NUM_CONNECTION];
  * @brief Convert an omnixtend structure to packet format
  */
 int
-ox_struct_to_packet(struct ox_packet_struct *ox_p, char *send_buffer,
-		    int *send_buffer_size)
+//ox_struct_to_packet(struct ox_packet_struct *ox_p, char *send_buffer,
+//		    int *send_buffer_size)
+ox_struct_to_packet(struct ox_packet_struct *ox_p)
 {
     int packet_size = 0;
     uint64_t mask;
     uint64_t be64_temp;
     int offset = 0;
+    char *buffer = ox_p->packet_buffer;
 
     if (ox_p->flit_cnt < 5) {	// at minimum. packet_size must be 70
 	packet_size +=
@@ -34,28 +36,26 @@ ox_struct_to_packet(struct ox_packet_struct *ox_p, char *send_buffer,
 	     sizeof(ox_p->tl_msg_mask));
     }
 
-    bzero((void *) send_buffer, packet_size);
+    bzero((void *) buffer, sizeof(struct eth_header) + sizeof(struct tloe_header));
 
     // Ethernet Header
-    memcpy(send_buffer, &(ox_p->eth_hdr), sizeof(struct eth_header));
+    memcpy(buffer, &(ox_p->eth_hdr), sizeof(struct eth_header));
     offset += sizeof(struct eth_header);
 
     // TLoE frame Header
     be64_temp = htobe64(*(uint64_t *) & (ox_p->tloe_hdr));
-    memcpy(send_buffer + offset, &be64_temp, sizeof(uint64_t));
+    memcpy(buffer + offset, &be64_temp, sizeof(uint64_t));
     offset += sizeof(uint64_t);
 
-    if (ox_p->flit_cnt > 0 && ox_p->flits != NULL) {
-	memcpy(send_buffer + offset, ox_p->flits,
-	       sizeof(uint64_t) * ox_p->flit_cnt);
-	PRINT_LINE("ox_p->flits[0]=0x%lx\n", ox_p->flits[0]);
-    }
+    if ( ox_p->flits == NULL)
+        ox_p->flits = (uint64_t *)(buffer + offset);
+
     // TLoE frame mask
     mask = htobe64(ox_p->tl_msg_mask);
-    memcpy(send_buffer + packet_size - sizeof(uint64_t), &mask,
+    memcpy(buffer + packet_size - sizeof(uint64_t), &mask,
 	   sizeof(uint64_t));
 
-    *send_buffer_size = packet_size;
+    ox_p->packet_size = packet_size;
 
     return 0;
 }
@@ -64,47 +64,51 @@ ox_struct_to_packet(struct ox_packet_struct *ox_p, char *send_buffer,
  * @brief Change the packet to an omnixtend structure
  */
 int
-packet_to_ox_struct(char *recv_buffer, int recv_size,
-		    struct ox_packet_struct *ox_p)
+//packet_to_ox_struct(char *recv_buffer, int recv_size,
+//		    struct ox_packet_struct *ox_p)
+packet_to_ox_struct(struct ox_packet_struct *ox_p)
 {
     uint64_t tl_msg_mask = 0;
     uint64_t tloe_hdr = 0;
     int tl_msg_full_count_by_8bytes = 0;
     struct eth_header *recv_packet_eth_hdr;
     struct tloe_header *recv_packet_tloe_hdr;
+    int packet_size = ox_p->packet_size;
+
+    char *buffer = ox_p->packet_buffer;
 
     struct tl_msg_header_chan_AD __tl_msg_hdr = { 0, };
     uint64_t temp_tl_msg_hdr =
-	*(uint64_t *) (recv_buffer + sizeof(struct eth_header) +
+	*(uint64_t *) (buffer + sizeof(struct eth_header) +
 		       sizeof(struct tloe_header));
     *(uint64_t *) & __tl_msg_hdr = be64toh(temp_tl_msg_hdr);
 
     // Ethernet MAC header (14 bytes)
-    recv_packet_eth_hdr = (struct eth_header *) recv_buffer;
+    recv_packet_eth_hdr = (struct eth_header *) buffer;
 
     memcpy(&(ox_p->eth_hdr), recv_packet_eth_hdr,
 	   sizeof(struct eth_header));
 
     // TLoE frame header (8 bytes)
     recv_packet_tloe_hdr =
-	(struct tloe_header *) (recv_buffer + sizeof(struct eth_header));
+	(struct tloe_header *) (buffer + sizeof(struct eth_header));
     tloe_hdr = be64toh(*(uint64_t *) recv_packet_tloe_hdr);
     memcpy(&(ox_p->tloe_hdr), &tloe_hdr, sizeof(uint64_t));
 
     // TileLink messages (8 bytes * n)
     tl_msg_full_count_by_8bytes =
-	(recv_size - sizeof(struct eth_header) -
+	(packet_size - sizeof(struct eth_header) -
 	 sizeof(struct tloe_header) -
 	 sizeof(uint64_t) /* mask */ ) / sizeof(uint64_t);
     ox_p->flit_cnt = tl_msg_full_count_by_8bytes;
 
     // just pass the pointer of receive buffer
     ox_p->flits =
-	(uint64_t *) (recv_buffer + sizeof(struct eth_header) +
+	(uint64_t *) (buffer + sizeof(struct eth_header) +
 		      sizeof(struct tloe_header));
 
     // TLoE frame mask (8 bytes)
-    memcpy(&tl_msg_mask, recv_buffer + recv_size - sizeof(tl_msg_mask),
+    memcpy(&tl_msg_mask, buffer + packet_size - sizeof(tl_msg_mask),
 	   sizeof(tl_msg_mask));
     ox_p->tl_msg_mask = be64toh(tl_msg_mask);
 
@@ -162,7 +166,7 @@ void setup_send_ox_eth_hdr(int connection_id, struct ox_packet_struct * send_ox_
 {
     if ( connection_id < 0 ) return;
 
-    memset(send_ox_p, 0, sizeof(struct ox_packet_struct));
+//    memset(send_ox_p, 0, sizeof(struct ox_packet_struct));
 
     send_ox_p->eth_hdr.dst_mac_addr = ox_conn_list[connection_id].your_mac_addr;
     send_ox_p->eth_hdr.src_mac_addr = ox_conn_list[connection_id].my_mac_addr;
@@ -204,7 +208,7 @@ int set_seq_num_to_ox_packet(int connection_id, struct ox_packet_struct *send_ox
 	return 0;
 }
 
-#define SEQ_NUM_VALID_WINDOW 100
+#define SEQ_NUM_VALID_WINDOW 1000
 
 int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_p)
 {
@@ -212,7 +216,7 @@ int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_
 
 	PRINT_LINE("recv seq_num  = %x\n", recv_ox_p->tloe_hdr.seq_num);
 	pthread_mutex_lock(&seq_num_lock);
-	if ( ((recv_ox_p->tloe_hdr.seq_num >= ox_conn_list[connection_id].your_seq_num_expected) &&
+/*	if ( ((recv_ox_p->tloe_hdr.seq_num >= ox_conn_list[connection_id].your_seq_num_expected) &&
         SEQ_NUM_VALID_WINDOW > (recv_ox_p->tloe_hdr.seq_num - ox_conn_list[connection_id].your_seq_num_expected)) || ((recv_ox_p->tloe_hdr.seq_num < ox_conn_list[connection_id].your_seq_num_expected ) && SEQ_NUM_VALID_WINDOW > ( 0x400000 - (ox_conn_list[connection_id].your_seq_num_expected - recv_ox_p->tloe_hdr.seq_num))) ) {
 	    ox_conn_list[connection_id].your_seq_num_expected = recv_ox_p->tloe_hdr.seq_num + 1;
         ret = 1;
@@ -220,7 +224,10 @@ int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_
         ret = 0; //same seq with before seq
 	} else
         ret = -1;
-        
+*/
+    if ( recv_ox_p->tloe_hdr.seq_num >= ox_conn_list[connection_id].your_seq_num_expected )
+        ox_conn_list[connection_id].your_seq_num_expected = recv_ox_p->tloe_hdr.seq_num + 1;
+
 	pthread_mutex_unlock(&seq_num_lock);
 
 	return ret;

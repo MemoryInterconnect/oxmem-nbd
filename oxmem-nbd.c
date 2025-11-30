@@ -54,7 +54,7 @@
 #define MAX_RETRY_COUNT 5
 
 /* Timeout configuration */
-#define TIMEOUT_NS          10000000    /* 10ms in nanoseconds */
+#define TIMEOUT_NS          1000000     /* 10ms in nanoseconds */
 #define NS_PER_SEC          1000000000
 
 /*
@@ -85,8 +85,10 @@ struct oxmem_global {
 /* TileLink flit structure */
 struct tl_flit {
     struct tl_msg_header_chan_AD hdr;
-    uint64_t addr;
-    uint64_t flits[READ_WRITE_UNIT / sizeof(uint64_t) + 2];
+    uint64_t tl_addr;
+    char * host_buf;
+    size_t size;
+    uint64_t * flits;
 };
 
 /* TileLink message status */
@@ -103,13 +105,6 @@ struct tl_msg_list_entry {
     struct tl_flit recv_tl;
     int tl_status;
     sem_t sem;
-};
-
-/* Work item for post-processing received packets */
-struct recv_work_item {
-    char recv_buffer[BUFFER_SIZE];
-    int recv_size;
-    uint64_t id;
 };
 
 /*
@@ -136,6 +131,8 @@ static uint64_t recv_id = 0;
  * Function Declarations
  * =============================================================================
  */
+
+struct ox_packet_struct * alloc_ox_packet_struct(void);
 
 /* Thread entry points */
 void *nbd_server_thread(void *arg);
@@ -190,7 +187,7 @@ static size_t
 round_down_to_power_of_2(size_t size, int *log2_size)
 {
     int i;
-    for (i = 10; i >= 0; i--) {
+    for (i = 13; i >= 0; i--) {
         if (size >= (1U << i)) {
             if (log2_size)
                 *log2_size = i;
@@ -232,21 +229,30 @@ init_tl_msg_list(void)
  * Allocate a free TileLink message entry
  * Returns index on success, -1 if no free entries
  */
+
+int last_tl_source = 0;
+
 static int
 get_tl_msg(void)
 {
     int i;
+    int source;
 
     pthread_mutex_lock(&tl_msg_list_lock);
     for (i = 0; i < MAX_TL_MSG_LIST; i++) {
-        if (tl_msg_list[i].tl_status == TL_FREE) {
-            tl_msg_list[i].tl_status = TL_IN_USE;
+        source = i+last_tl_source+1;
+        source %= MAX_TL_MSG_LIST;
+        if (tl_msg_list[source].tl_status == TL_FREE) {
+            tl_msg_list[source].tl_status = TL_IN_USE;
             break;
         }
     }
+    if ( i < MAX_TL_MSG_LIST ) {
+        last_tl_source = source;
+    }
     pthread_mutex_unlock(&tl_msg_list_lock);
 
-    return (i < MAX_TL_MSG_LIST) ? i : -1;
+    return (i < MAX_TL_MSG_LIST) ? source : -1;
 }
 
 /**
@@ -377,19 +383,13 @@ update_send_ox_credit(struct ox_packet_struct *send_ox)
 static int
 send_ox_packet(struct ox_packet_struct *send_ox)
 {
-LOG_DEBUG("");
-    struct ox_packet_struct *send_ox_buffer = malloc(sizeof(struct ox_packet_struct));
-    if (!send_ox_buffer)
+    if (!send_ox)
         return -ENOMEM;
 
-    pthread_mutex_lock(&send_lock);
-    memcpy(send_ox_buffer, send_ox, sizeof(struct ox_packet_struct));
-    pthread_mutex_unlock(&send_lock);
+    if (send_ox->tloe_hdr.msg_type != OPEN_CONN)
+        send_ox->tloe_hdr.ack = 1;
 
-    if (send_ox_buffer->tloe_hdr.msg_type != OPEN_CONN)
-        send_ox_buffer->tloe_hdr.ack = 1;
-
-    enqueue(&q_send, (uint64_t)send_ox_buffer);
+    enqueue(&q_send, (uint64_t)send_ox);
     sem_post(&send_sem);
 
     return 0;
@@ -401,11 +401,11 @@ LOG_DEBUG("");
 static void
 send_disconnection(void)
 {
-    struct ox_packet_struct send_ox;
+    struct ox_packet_struct * send_ox;
 
-    setup_send_ox_eth_hdr(global_state.oxmem_info.connection_id, &send_ox);
-    send_ox.tloe_hdr.msg_type = CLOSE_CONN;
-    send_ox_packet(&send_ox);
+    send_ox = alloc_ox_packet_struct();
+    send_ox->tloe_hdr.msg_type = CLOSE_CONN;
+    send_ox_packet(send_ox);
     usleep(100000);
 }
 
@@ -415,7 +415,7 @@ send_disconnection(void)
 static int
 send_open_connection(uint64_t my_mac, uint64_t dst_mac)
 {
-    struct ox_packet_struct send_ox;
+    struct ox_packet_struct * send_ox;
     int connection_id;
 
     connection_id = add_new_connection(dst_mac, my_mac, 0x3FFFFF);
@@ -426,18 +426,20 @@ send_open_connection(uint64_t my_mac, uint64_t dst_mac)
 
     global_state.oxmem_info.connection_id = connection_id;
 
-    setup_send_ox_eth_hdr(connection_id, &send_ox);
-
     /* Send OPEN_CONN on Channel A */
-    send_ox.tloe_hdr.chan = CHANNEL_A;
-    send_ox.tloe_hdr.credit = DEFAULT_CREDIT;
-    send_ox.tloe_hdr.msg_type = OPEN_CONN;
-    send_ox_packet(&send_ox);
+    send_ox = alloc_ox_packet_struct();
+    send_ox->tloe_hdr.chan = CHANNEL_A;
+    send_ox->tloe_hdr.credit = DEFAULT_CREDIT;
+    send_ox->tloe_hdr.msg_type = OPEN_CONN;
+    send_ox_packet(send_ox);
+
 
     /* Send NORMAL on Channel D */
-    send_ox.tloe_hdr.msg_type = NORMAL;
-    send_ox.tloe_hdr.chan = CHANNEL_D;
-    send_ox_packet(&send_ox);
+    send_ox = alloc_ox_packet_struct();
+    send_ox->tloe_hdr.chan = CHANNEL_D;
+    send_ox->tloe_hdr.credit = DEFAULT_CREDIT;
+    send_ox->tloe_hdr.msg_type = NORMAL;
+    send_ox_packet(send_ox);
 
     return 0;
 }
@@ -448,10 +450,11 @@ send_open_connection(uint64_t my_mac, uint64_t dst_mac)
 static int
 send_ack(void)
 {
-    struct ox_packet_struct send_ox;
+    struct ox_packet_struct * send_ox;
 
-    setup_send_ox_eth_hdr(global_state.oxmem_info.connection_id, &send_ox);
-    return send_ox_packet(&send_ox);
+    send_ox = alloc_ox_packet_struct();
+
+    return send_ox_packet(send_ox);
 }
 
 
@@ -490,6 +493,16 @@ cleanup_and_exit(void)
     if (global_state.oxmem_info.sockfd > 0)
         close(global_state.oxmem_info.sockfd);
 
+    /* Drain and free any remaining packets in queues */
+    struct ox_packet_struct *ox;
+    while ((ox = (struct ox_packet_struct *)dequeue(&q_send)) != NULL)
+        free(ox);
+    while ((ox = (struct ox_packet_struct *)dequeue(&q_recv_post)) != NULL)
+        free(ox);
+
+    /* Cleanup semaphores */
+    sem_destroy(&recv_post_sem);
+
     printf("Cleanup complete\n");
 }
 
@@ -503,13 +516,18 @@ cleanup_and_exit(void)
  * Wait for a TileLink response with timeout and retransmit loop
  * Returns 0 on success (keeps retrying until success)
  */
+
+uint64_t retransmit_count = 0;
+
 static int
-wait_for_response(int source, struct ox_packet_struct *send_ox,
-                  off_t offset_for_log)
+wait_for_response(int source)
 {
     struct timespec timeout;
     int ret;
     int retry_count = 0;
+    struct ox_packet_struct *send_ox;
+    uint64_t be64_temp;
+    struct tl_flit *tl = &tl_msg_list[source].sent_tl;
 
     set_timeout(&timeout, TIMEOUT_NS);
     ret = sem_timedwait(&tl_msg_list[source].sem, &timeout);
@@ -520,12 +538,16 @@ wait_for_response(int source, struct ox_packet_struct *send_ox,
     /* Timeout - enter retransmit loop */
     while (ret != 0) {
         retry_count++;
-        LOG_DEBUG("TIMEOUT source=%d offset=%lx - retransmitting (retry %d)",
-                  source, offset_for_log, retry_count);
+        LOG_DEBUG("READ TIMEOUT source=%d offset=%lx - retransmitting (retry %d)",
+                  source, tl->tl_addr, retry_count);
 
+        send_ox = alloc_ox_packet_struct();
         send_ox->tl_msg_mask = 0x1;
         send_ox->flit_cnt = 2;
-        send_ox->flits = tl_msg_list[source].sent_tl.flits;
+
+        memcpy(&be64_temp, &tl->hdr, sizeof(uint64_t));
+        send_ox->flits[0] = be64toh(be64_temp);
+        send_ox->flits[1] = be64toh(tl->tl_addr);
 
         sem_destroy(&tl_msg_list[source].sem);
         sem_init(&tl_msg_list[source].sem, 0, 0);
@@ -533,15 +555,35 @@ wait_for_response(int source, struct ox_packet_struct *send_ox,
 
         send_ox_packet(send_ox);
 
-//        LOG_INFO("Retransmitted source=%d addr=%lx (retry %d), waiting again", source, tl_msg_list[source].sent_tl.addr, retry_count);
+        retransmit_count ++;
+        LOG_DEBUG("READ Retransmitted source=%d addr=%lx (retry %d) retransmit total =%ld", source, tl_msg_list[source].sent_tl.tl_addr, retry_count, retransmit_count);
 
-        set_timeout(&timeout, TIMEOUT_NS);
+        set_timeout(&timeout, TIMEOUT_NS*5);
         ret = sem_timedwait(&tl_msg_list[source].sem, &timeout);
 
         if ( retry_count >= MAX_RETRY_COUNT ) return -1;;
     }
 
     return 0;
+}
+
+struct ox_packet_struct * alloc_ox_packet_struct(void)
+{
+    struct ox_packet_struct * ox;
+
+    ox = malloc(sizeof(struct ox_packet_struct));
+
+    if ( ox == NULL ) {
+        LOG_ERROR("malloc error!");
+        return NULL;
+    }
+
+    memset(ox, 0, sizeof(struct ox_packet_struct));
+    ox->flits = (void*)(ox->packet_buffer) + sizeof(struct eth_header) + sizeof(struct tloe_header);
+
+    setup_send_ox_eth_hdr(global_state.oxmem_info.connection_id, ox);
+
+    return ox;
 }
 
 /**
@@ -551,15 +593,15 @@ wait_for_response(int source, struct ox_packet_struct *send_ox,
 static int
 oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bdev)
 {
-    struct ox_packet_struct send_ox;
+    struct ox_packet_struct * send_ox;
     size_t bytes_processed = 0;
     off_t absolute_offset = bdev->device_base + offset;
     int source_list[1024];
-    size_t chunk_sizes[1024];
-    size_t chunk_offsets[1024];
     int send_idx = 0;
     int wait_idx = 0;
     int coalesce_count = 0;
+    uint64_t be64_temp;
+    struct tl_flit *tl = NULL;
 
     /* Bounds check */
     if (offset + size > bdev->device_size) {
@@ -573,11 +615,11 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
         return -ENXIO;
     }
 
-//    LOG_INFO("READ offset=%lx size=%ld", offset, size);
+    LOG_DEBUG("READ offset=%lx size=%ld", offset, size);
 
     pthread_mutex_lock(&read_lock);
 
-    setup_send_ox_eth_hdr(global_state.oxmem_info.connection_id, &send_ox);
+    send_ox = alloc_ox_packet_struct();
 
     /* Read in chunks with sliding window flow control */
     while (bytes_processed < size || wait_idx < send_idx) {
@@ -595,39 +637,35 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
             int source = get_tl_msg();
             if (source < 0) {
                 LOG_ERROR("No free TL message slots");
-                return -ENOMEM;
+                free(send_ox);
+                send_ox = NULL;
+                size = -ENOMEM;
+                goto out;
             }
             source_list[send_idx] = source;
 
             /* Setup TileLink GET message */
-            struct tl_flit *tl = &tl_msg_list[source].sent_tl;
+            tl = &tl_msg_list[source].sent_tl;
             tl->hdr.source = source;
             tl->hdr.size = log2_size;
             tl->hdr.opcode = A_GET_OPCODE;
             tl->hdr.chan = CHANNEL_A;
-            tl->addr = absolute_offset + bytes_processed;
+            tl->tl_addr = absolute_offset + bytes_processed; //target buffer address
 
-            uint64_t be64_temp;
+            tl->size = chunk_size;
+            tl->host_buf = buf + bytes_processed;
+
+            /* Coalesce multiple requests into single packet */
             memcpy(&be64_temp, &tl->hdr, sizeof(uint64_t));
-            tl->flits[0] = be64toh(be64_temp);
-            tl->flits[1] = be64toh(tl->addr);
+
+            send_ox->flits[coalesce_count * 2] = be64toh(be64_temp);
+            send_ox->flits[coalesce_count * 2 + 1] = be64toh(tl->tl_addr);
 
             sem_init(&tl_msg_list[source].sem, 0, 0);
             tl_msg_list[source].tl_status = TL_SENT;
 
-            /* Coalesce multiple requests into single packet */
-            if (send_ox.flits == NULL) {
-                send_ox.flits = tl->flits;
-            } else {
-                send_ox.flits[coalesce_count * 2] = tl->flits[0];
-                send_ox.flits[coalesce_count * 2 + 1] = tl->flits[1];
-            }
-
-            send_ox.tl_msg_mask |= 1UL << (coalesce_count * 2);
-            send_ox.flit_cnt += 2;
-
-            chunk_sizes[send_idx] = chunk_size;
-            chunk_offsets[send_idx] = bytes_processed;
+            send_ox->tl_msg_mask |= 1UL << (coalesce_count * 2);
+            send_ox->flit_cnt += 2;
 
             bytes_processed += chunk_size;
             send_idx++;
@@ -637,10 +675,17 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
             if (coalesce_count >= READ_COALESCE_COUNT ||
                 coalesce_count >= MAX_INFLIGHT_READS ||
                 bytes_processed >= size) {
-                send_ox_packet(&send_ox);
-                send_ox.flits = NULL;
-                send_ox.flit_cnt = 0;
-                send_ox.tl_msg_mask = 0;
+
+                //hand over the send_ox to send_thread
+                send_ox_packet(send_ox);
+
+                if ( bytes_processed < size ) {
+                    //it needs new send_ox now
+                    send_ox = alloc_ox_packet_struct();
+                } else {
+                    send_ox = NULL;
+                }
+
                 coalesce_count = 0;
             }
         }
@@ -649,20 +694,29 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
         if (wait_idx < send_idx) {
             int source = source_list[wait_idx];
 
-            if ( 0 == wait_for_response(source, &send_ox,
-                              absolute_offset + chunk_offsets[wait_idx]) ) {
-                ;
-                /* Copy response data */
-                memcpy(buf + chunk_offsets[wait_idx],
-                       &tl_msg_list[source].recv_tl.flits[1],
-                       chunk_sizes[wait_idx]);
+            if ( 0 != wait_for_response(source) ) {
+                size = -1;
+                goto out;
             }
-
+            // copying is already done in recv_thread and handler.
             sem_destroy(&tl_msg_list[source].sem);
             free_tl_msg(source);
             wait_idx++;
         }
     }
+
+out:
+    /* Clean up any remaining in-flight TL messages on error */
+    while (wait_idx < send_idx) {
+        int source = source_list[wait_idx];
+        sem_destroy(&tl_msg_list[source].sem);
+        free_tl_msg(source);
+        wait_idx++;
+    }
+
+    /* Free the last allocated send_ox that wasn't sent */
+    if (send_ox)
+        free(send_ox);
 
     pthread_mutex_unlock(&read_lock);
     return size;
@@ -673,12 +727,14 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
  * Similar to wait_for_response but includes data flits in retransmit
  */
 static int
-wait_for_write_response(int source, struct ox_packet_struct *send_ox,
-                        size_t chunk_size, off_t offset_for_log)
+wait_for_write_response(int source)
 {
     struct timespec timeout;
     int ret;
     int retry_count = 0;
+    struct ox_packet_struct * send_ox = NULL;
+    uint64_t be64_temp;
+    struct tl_flit *tl = &tl_msg_list[source].sent_tl;
 
     set_timeout(&timeout, NS_PER_SEC);  /* 1 second for writes */
     ret = sem_timedwait(&tl_msg_list[source].sem, &timeout);
@@ -690,11 +746,21 @@ wait_for_write_response(int source, struct ox_packet_struct *send_ox,
     while (ret != 0) {
         retry_count++;
         LOG_DEBUG("WRITE TIMEOUT source=%d offset=%lx - retransmitting (retry %d)",
-                  source, offset_for_log, retry_count);
+                  source, tl->tl_addr, retry_count);
+
+        send_ox = alloc_ox_packet_struct();
+        tl->flits = send_ox->flits;
+
+        memcpy(&be64_temp, &tl->hdr, sizeof(uint64_t));
+            
+        tl->flits[0] = be64toh(be64_temp);
+        tl->flits[1] = be64toh(tl->tl_addr);
+
+        /* Copy data to flits */
+        memcpy(&tl->flits[2], tl->host_buf, tl->size);
 
         send_ox->tl_msg_mask = 0x1;
-        send_ox->flit_cnt = 2 + chunk_size / sizeof(uint64_t);
-        send_ox->flits = tl_msg_list[source].sent_tl.flits;
+        send_ox->flit_cnt = 2 + tl->size / sizeof(uint64_t);
 
         sem_destroy(&tl_msg_list[source].sem);
         sem_init(&tl_msg_list[source].sem, 0, 0);
@@ -702,7 +768,8 @@ wait_for_write_response(int source, struct ox_packet_struct *send_ox,
 
         send_ox_packet(send_ox);
 
-        LOG_DEBUG("Retransmitted source=%d (retry %d), waiting again", source, retry_count);
+        retransmit_count++;
+        LOG_DEBUG("WRITE Retransmitted source=%d addr=%lx (retry %d) retransmit total =%ld", source, tl->tl_addr, retry_count, retransmit_count);
 
         set_timeout(&timeout, NS_PER_SEC);
         ret = sem_timedwait(&tl_msg_list[source].sem, &timeout);
@@ -719,7 +786,7 @@ static int
 oxmem_write_blocking(const char *buf, size_t size, off_t offset,
                      struct oxmem_bdev *bdev)
 {
-    struct ox_packet_struct send_ox;
+    struct ox_packet_struct * send_ox;
     size_t bytes_written = 0;
     off_t absolute_offset = bdev->device_base + offset;
     int source_list[1024];
@@ -733,9 +800,9 @@ oxmem_write_blocking(const char *buf, size_t size, off_t offset,
         return -EINVAL;
     }
 
-//    LOG_INFO("WRITE offset=%lx size=%ld", offset, size);
+    LOG_DEBUG("WRITE offset=%lx size=%ld", offset, size);
 
-    setup_send_ox_eth_hdr(global_state.oxmem_info.connection_id, &send_ox);
+    send_ox = alloc_ox_packet_struct();
 
     /* Write in chunks with sliding window flow control */
     while (bytes_written < size || wait_idx < send_idx) {
@@ -753,6 +820,7 @@ oxmem_write_blocking(const char *buf, size_t size, off_t offset,
             int source = get_tl_msg();
             if (source < 0) {
                 LOG_ERROR("No free TL message slots");
+                free(send_ox);
                 return -ENOMEM;
             }
             source_list[send_idx] = source;
@@ -763,42 +831,55 @@ oxmem_write_blocking(const char *buf, size_t size, off_t offset,
             tl->hdr.size = log2_size;
             tl->hdr.opcode = A_PUTFULLDATA_OPCODE;
             tl->hdr.chan = CHANNEL_A;
+            tl->tl_addr = absolute_offset + bytes_written;
+            tl->size = chunk_size;
+            tl->flits = send_ox->flits;
+            tl->host_buf = (char*)buf + bytes_written;
 
             uint64_t be64_temp;
             memcpy(&be64_temp, &tl->hdr, sizeof(uint64_t));
+            
             tl->flits[0] = be64toh(be64_temp);
-
-            be64_temp = absolute_offset + bytes_written;
-            tl->flits[1] = be64toh(be64_temp);
+            tl->flits[1] = be64toh(tl->tl_addr);
 
             /* Copy data to flits */
-            memcpy(&tl->flits[2], buf + bytes_written, chunk_size);
+            memcpy(&tl->flits[2], tl->host_buf, tl->size);
 
-            send_ox.tl_msg_mask = 0x1;
-            send_ox.flit_cnt = 2 + chunk_size / sizeof(uint64_t);
-            send_ox.flits = tl->flits;
+            send_ox->tl_msg_mask = 0x1;
+            send_ox->flit_cnt = 2 + chunk_size / sizeof(uint64_t);
             tl_msg_list[source].tl_status = TL_SENT;
 
             sem_init(&tl_msg_list[source].sem, 0, 0);
-            send_ox_packet(&send_ox);
+
+            //hand over the send_ox to send_thread
+            send_ox_packet(send_ox);
 
             chunk_sizes[send_idx] = chunk_size;
             bytes_written += chunk_size;
             send_idx++;
+
+            if ( bytes_written < size ) {
+                //we need new send_ox
+                send_ox = alloc_ox_packet_struct();
+            } else
+                send_ox = NULL;
         }
 
         /* Wait for oldest in-flight request */
         if (wait_idx < send_idx) {
             int source = source_list[wait_idx];
 
-            wait_for_write_response(source, &send_ox, chunk_sizes[wait_idx],
-                                    absolute_offset + bytes_written);
+            wait_for_write_response(source);
 
             sem_destroy(&tl_msg_list[source].sem);
             free_tl_msg(source);
             wait_idx++;
         }
     }
+
+    /* Free the last allocated send_ox that wasn't sent */
+    if (send_ox)
+        free(send_ox);
 
     return size;
 }
@@ -840,7 +921,6 @@ nbd_server_thread(void *arg)
     char *buffer;
     ssize_t bytes_read;
 
-LOG_DEBUG("");
     buffer = malloc(1024 * 1024);  /* 1MB buffer */
     if (!buffer) {
         LOG_ERROR("Failed to allocate buffer for device %d", bdev->device_index);
@@ -972,10 +1052,10 @@ send_thread(void *arg)
         set_seq_num_to_ox_packet(global_state.oxmem_info.connection_id, send_ox);
         update_send_ox_credit(send_ox);
 
-        /* Convert to wire format and send */
-        ox_struct_to_packet(send_ox, send_buffer, &send_size);
+        /* Convert to wire format. the packet is now placed in send_ox->packet_buffer and size is send_ox->packet_size */
+        ox_struct_to_packet(send_ox);
 
-        if (send(global_state.oxmem_info.sockfd, send_buffer, send_size, 0) < 0)
+        if (send(global_state.oxmem_info.sockfd, send_ox->packet_buffer, send_ox->packet_size, 0) < 0)
             LOG_ERROR("send failed: %s", strerror(errno));
 
         if (send_ox->tloe_hdr.msg_type == CLOSE_CONN) {
@@ -997,16 +1077,15 @@ send_thread(void *arg)
 void *
 post_handler_thread(void *arg)
 {
-    struct recv_work_item *work_item;
-    struct ox_packet_struct recv_ox;
+    struct ox_packet_struct * recv_ox;
 
     (void)arg;
 
     printf("Post-handler thread started\n");
 
     while (1) {
-        work_item = (struct recv_work_item *)dequeue(&q_recv_post);
-        if (work_item == NULL) {
+        recv_ox = (struct ox_packet_struct *)dequeue(&q_recv_post);
+        if (recv_ox == NULL) {
             if (shutdown_requested)
                 break;
             sem_wait(&recv_post_sem);
@@ -1014,21 +1093,21 @@ post_handler_thread(void *arg)
         }
 
         /* Parse received packet */
-        packet_to_ox_struct(work_item->recv_buffer, work_item->recv_size, &recv_ox);
+        packet_to_ox_struct(recv_ox);
 
         /* Update expected sequence number */
-        update_seq_num_expected(global_state.oxmem_info.connection_id, &recv_ox);
+        update_seq_num_expected(global_state.oxmem_info.connection_id, recv_ox);
 
         /* Handle ACK-only packets */
-        if (recv_ox.tloe_hdr.msg_type == ACK_ONLY) {
-            free(work_item);
+        if (recv_ox->tloe_hdr.msg_type == ACK_ONLY) {
+            free(recv_ox);
             continue;
         }
 
         /* Handle CLOSE_CONN */
-        if (recv_ox.tloe_hdr.msg_type == CLOSE_CONN) {
+        if (recv_ox->tloe_hdr.msg_type == CLOSE_CONN) {
             LOG_DEBUG("CLOSE_CONN packet received");
-            free(work_item);
+            free(recv_ox);
             break;
         }
 
@@ -1037,20 +1116,20 @@ post_handler_thread(void *arg)
             send_ack();
 
         /* Update remote credit */
-        if (recv_ox.tloe_hdr.chan > 0) {
+        if (recv_ox->tloe_hdr.chan > 0) {
             pthread_mutex_lock(&credit_lock);
-            global_state.your_credit_remained[recv_ox.tloe_hdr.chan - 1] +=
-                1 << recv_ox.tloe_hdr.credit;
+            global_state.your_credit_remained[recv_ox->tloe_hdr.chan - 1] +=
+                1 << recv_ox->tloe_hdr.credit;
             pthread_mutex_unlock(&credit_lock);
         }
 
         /* Process TileLink messages */
-        if (recv_ox.tl_msg_mask != 0) {
-            uint64_t mask = recv_ox.tl_msg_mask;
+        if (recv_ox->tl_msg_mask != 0) {
+            uint64_t mask = recv_ox->tl_msg_mask;
 
             pthread_mutex_lock(&credit_lock);
             global_state.my_credit_in_use[CHANNEL_D - 1] +=
-                get_used_credit(&recv_ox, CHANNEL_D);
+                get_used_credit(recv_ox, CHANNEL_D);
             pthread_mutex_unlock(&credit_lock);
 
             /* Match responses to pending requests */
@@ -1059,7 +1138,7 @@ post_handler_thread(void *arg)
                     continue;
 
                 struct tl_msg_header_chan_AD tl_msg_header;
-                uint64_t be64_temp = be64toh(recv_ox.flits[i]);
+                uint64_t be64_temp = be64toh(recv_ox->flits[i]);
                 memcpy(&tl_msg_header, &be64_temp, sizeof(uint64_t));
 
                 int source = tl_msg_header.source;
@@ -1079,18 +1158,18 @@ post_handler_thread(void *arg)
                 /* Copy data for ACCESSACKDATA responses */
                 if (tl_msg_header.chan == CHANNEL_D &&
                     tl_msg_header.opcode == D_ACCESSACKDATA_OPCODE) {
-                    memcpy(&tl_msg_list[source].recv_tl.flits[0],
-                           &recv_ox.flits[i],
-                           (1 << tl_msg_header.size) + sizeof(uint64_t));
+                    
+                    struct tl_flit *tl = &tl_msg_list[source].sent_tl;
+                    memcpy(tl->host_buf, &(recv_ox->flits[i+1]), tl->size);
                 }
 
                 /* Signal waiting thread */
                 tl_msg_list[source].tl_status = TL_RECEIVED;
                 sem_post(&tl_msg_list[source].sem);
-            }
+            }        /* Send ACK if send queue is empty */
         }
 
-        free(work_item);
+        free(recv_ox);
     }
 
     printf("Post-handler thread exiting\n");
@@ -1104,7 +1183,8 @@ post_handler_thread(void *arg)
 void *
 recv_thread(void *arg)
 {
-    char recv_buffer[BUFFER_SIZE];
+    struct ox_packet_struct * recv_ox = NULL;
+    char * recv_buffer;
     int recv_size;
 
     (void)arg;
@@ -1112,12 +1192,19 @@ recv_thread(void *arg)
     printf("Receive thread started\n");
 
     while (1) {
+        if ( recv_ox == NULL)
+            recv_ox = alloc_ox_packet_struct();
+
+        recv_buffer = recv_ox->packet_buffer;
+
         recv_size = recv(global_state.oxmem_info.sockfd, recv_buffer,
                          BUFFER_SIZE, 0);
 
         if (recv_size < 0) {
-            if (shutdown_requested)
+            if (shutdown_requested) {
+                free(recv_ox);
                 break;
+            }
             LOG_ERROR("recv failed: %s", strerror(errno));
             continue;
         }
@@ -1127,19 +1214,11 @@ recv_thread(void *arg)
         if (eth_hdr->h_proto != OX_ETHERTYPE)
             continue;
 
-LOG_DEBUG("");
         /* Allocate and enqueue work item */
-        struct recv_work_item *work_item = malloc(sizeof(struct recv_work_item));
-        if (!work_item) {
-            LOG_ERROR("Failed to allocate recv work item");
-            continue;
-        }
+        recv_ox->packet_size = recv_size;
 
-        work_item->id = recv_id++;
-        memcpy(work_item->recv_buffer, recv_buffer, recv_size);
-        work_item->recv_size = recv_size;
-
-        enqueue(&q_recv_post, (uint64_t)work_item);
+        enqueue(&q_recv_post, (uint64_t)recv_ox);
+        recv_ox = NULL;
         sem_post(&recv_post_sem);
     }
 
