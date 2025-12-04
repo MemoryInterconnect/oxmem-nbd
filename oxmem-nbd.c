@@ -33,7 +33,7 @@
 /* Logging infrastructure */
 #define LOG_INFO(fmt, ...)  printf("[INFO] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
-#if 0
+#if 1
 #define LOG_DEBUG(fmt, ...) printf("[DEBUG] %s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
 #else
 #define LOG_DEBUG(fmt, ...)
@@ -44,7 +44,7 @@
 #define NBD_BLOCK_SIZE      4096
 
 /* TileLink message configuration */
-#define MAX_TL_MSG_LIST     1000
+#define MAX_TL_MSG_LIST     4096
 #define READ_WRITE_UNIT     1024    /* Max single request size in bytes */
 
 /* Flow control configuration */
@@ -596,7 +596,7 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
     struct ox_packet_struct * send_ox;
     size_t bytes_processed = 0;
     off_t absolute_offset = bdev->device_base + offset;
-    int source_list[1024];
+    int source_list[MAX_TL_MSG_LIST];
     int send_idx = 0;
     int wait_idx = 0;
     int coalesce_count = 0;
@@ -695,6 +695,7 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
             int source = source_list[wait_idx];
 
             if ( 0 != wait_for_response(source) ) {
+                LOG_ERROR("Retransmit Timeout");
                 size = -1;
                 goto out;
             }
@@ -789,8 +790,8 @@ oxmem_write_blocking(const char *buf, size_t size, off_t offset,
     struct ox_packet_struct * send_ox;
     size_t bytes_written = 0;
     off_t absolute_offset = bdev->device_base + offset;
-    int source_list[1024];
-    size_t chunk_sizes[1024];
+    int source_list[MAX_TL_MSG_LIST];
+//    size_t chunk_sizes[1024];
     int send_idx = 0;
     int wait_idx = 0;
 
@@ -854,7 +855,7 @@ oxmem_write_blocking(const char *buf, size_t size, off_t offset,
             //hand over the send_ox to send_thread
             send_ox_packet(send_ox);
 
-            chunk_sizes[send_idx] = chunk_size;
+//            chunk_sizes[send_idx] = chunk_size;
             bytes_written += chunk_size;
             send_idx++;
 

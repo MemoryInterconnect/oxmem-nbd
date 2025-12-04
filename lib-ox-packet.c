@@ -198,6 +198,9 @@ static pthread_mutex_t seq_num_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int set_seq_num_to_ox_packet(int connection_id, struct ox_packet_struct *send_ox_p)
 {
+	if (connection_id < 0 || connection_id >= NUM_CONNECTION)
+		return -1;
+
 	pthread_mutex_lock(&seq_num_lock);
 
 	send_ox_p->tloe_hdr.seq_num = ox_conn_list[connection_id].my_seq_num++;
@@ -213,6 +216,9 @@ int set_seq_num_to_ox_packet(int connection_id, struct ox_packet_struct *send_ox
 int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_p)
 {
     int ret = 0;
+
+	if (connection_id < 0 || connection_id >= NUM_CONNECTION)
+		return -1;
 
 	PRINT_LINE("recv seq_num  = %x\n", recv_ox_p->tloe_hdr.seq_num);
 	pthread_mutex_lock(&seq_num_lock);
@@ -235,6 +241,8 @@ int update_seq_num_expected(int connection_id, struct ox_packet_struct *recv_ox_
 
 int get_seq_num_expected(int connection_id)
 {
+	if (connection_id < 0 || connection_id >= NUM_CONNECTION)
+		return -1;
 	return ox_conn_list[connection_id].your_seq_num_expected;
 }
 
