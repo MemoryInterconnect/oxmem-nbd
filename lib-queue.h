@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <pthread.h>
 
 // Define the structure for a node in the linked list
 typedef struct Node {
@@ -12,13 +13,14 @@ typedef struct Node {
 typedef struct Queue {
     Node* front;
     Node* rear;
+    pthread_mutex_t lock;  // Per-queue lock for thread safety
 } Queue;
 
 // Function to initialize the queue
 void initQueue(Queue* q); 
 
 // Function to check if the queue is empty
-uint64_t isEmpty(Queue* q);
+int isEmpty(Queue* q);
 
 // Function to add an element to the queue
 void enqueue(Queue* q, uint64_t data);

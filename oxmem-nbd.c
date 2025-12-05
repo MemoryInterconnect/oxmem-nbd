@@ -33,7 +33,7 @@
 /* Logging infrastructure */
 #define LOG_INFO(fmt, ...)  printf("[INFO] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
-#if 1
+#if 0
 #define LOG_DEBUG(fmt, ...) printf("[DEBUG] %s:%d " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
 #else
 #define LOG_DEBUG(fmt, ...)
@@ -49,8 +49,8 @@
 
 /* Flow control configuration */
 #define READ_COALESCE_COUNT 32 //32     /* Number of read requests to batch per packet */
-#define MAX_INFLIGHT_READS  32 //32     /* Max concurrent read requests in flight */
-#define MAX_INFLIGHT_WRITES 8 //8       /* Max concurrent write requests in flight */
+#define MAX_INFLIGHT_READS  96 //32     /* Max concurrent read requests in flight */
+#define MAX_INFLIGHT_WRITES 32          /* Max concurrent write requests in flight */
 #define MAX_RETRY_COUNT 5
 
 /* Timeout configuration */
@@ -532,8 +532,8 @@ wait_for_response(int source)
     set_timeout(&timeout, TIMEOUT_NS);
     ret = sem_timedwait(&tl_msg_list[source].sem, &timeout);
 
-    if (ret == 0)
-        return 0;
+ //   if (ret == 0)
+//        return 0;
 
     /* Timeout - enter retransmit loop */
     while (ret != 0) {
@@ -617,7 +617,7 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
 
     LOG_DEBUG("READ offset=%lx size=%ld", offset, size);
 
-    pthread_mutex_lock(&read_lock);
+//    pthread_mutex_lock(&read_lock);
 
     send_ox = alloc_ox_packet_struct();
 
@@ -719,7 +719,7 @@ out:
     if (send_ox)
         free(send_ox);
 
-    pthread_mutex_unlock(&read_lock);
+//    pthread_mutex_unlock(&read_lock);
     return size;
 }
 
@@ -740,8 +740,8 @@ wait_for_write_response(int source)
     set_timeout(&timeout, NS_PER_SEC);  /* 1 second for writes */
     ret = sem_timedwait(&tl_msg_list[source].sem, &timeout);
 
-    if (ret == 0)
-        return 0;
+//    if (ret == 0)
+//        return 0;
 
     /* Timeout - enter retransmit loop */
     while (ret != 0) {
