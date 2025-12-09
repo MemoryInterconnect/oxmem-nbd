@@ -26,6 +26,34 @@
 
 /*
  * =============================================================================
+ * Statistics Tracking
+ * =============================================================================
+ */
+
+/* Statistics structure for tracking I/O operations */
+struct io_stats {
+    uint64_t read_count;
+    uint64_t read_bytes;
+    uint64_t write_count;
+    uint64_t write_bytes;
+    pthread_mutex_t lock;
+};
+
+static struct io_stats global_stats = {
+    .read_count = 0,
+    .read_bytes = 0,
+    .write_count = 0,
+    .write_bytes = 0,
+    .lock = PTHREAD_MUTEX_INITIALIZER
+};
+
+#define STATS_UPDATE_INTERVAL_DEFAULT 2
+#define STATS_FILE_PATH "/tmp/memory_node.json"
+
+static int stats_update_interval = STATS_UPDATE_INTERVAL_DEFAULT;
+
+/*
+ * =============================================================================
  * Configuration Constants
  * =============================================================================
  */
@@ -49,12 +77,12 @@
 
 /* Flow control configuration */
 #define READ_COALESCE_COUNT 32 //32     /* Number of read requests to batch per packet */
-#define MAX_INFLIGHT_READS  96 //32     /* Max concurrent read requests in flight */
-#define MAX_INFLIGHT_WRITES 32          /* Max concurrent write requests in flight */
+#define MAX_INFLIGHT_READS  96 //96     /* Max concurrent read requests in flight */
+#define MAX_INFLIGHT_WRITES 32 //32          /* Max concurrent write requests in flight */
 #define MAX_RETRY_COUNT 5
 
 /* Timeout configuration */
-#define TIMEOUT_NS          1000000     /* 10ms in nanoseconds */
+#define TIMEOUT_NS          100000000     /* 10ms in nanoseconds */
 #define NS_PER_SEC          1000000000
 
 /*
@@ -140,6 +168,7 @@ void *nbd_do_it_thread(void *arg);
 void *recv_thread(void *arg);
 void *post_handler_thread(void *arg);
 void *send_thread(void *arg);
+void *stats_thread(void *arg);
 
 /* Cleanup and signal handling */
 static void cleanup_and_exit(void);
@@ -615,9 +644,9 @@ oxmem_read_blocking(char *buf, size_t size, off_t offset, struct oxmem_bdev *bde
         return -ENXIO;
     }
 
-    LOG_DEBUG("READ offset=%lx size=%ld", offset, size);
+    LOG_DEBUG("READ buf=%p offset=%lx size=%ld", buf, offset, size);
 
-//    pthread_mutex_lock(&read_lock);
+    pthread_mutex_lock(&read_lock);
 
     send_ox = alloc_ox_packet_struct();
 
@@ -719,7 +748,7 @@ out:
     if (send_ox)
         free(send_ox);
 
-//    pthread_mutex_unlock(&read_lock);
+    pthread_mutex_unlock(&read_lock);
     return size;
 }
 
@@ -803,6 +832,8 @@ oxmem_write_blocking(const char *buf, size_t size, off_t offset,
 
     LOG_DEBUG("WRITE offset=%lx size=%ld", offset, size);
 
+    pthread_mutex_lock(&read_lock);
+
     send_ox = alloc_ox_packet_struct();
 
     /* Write in chunks with sliding window flow control */
@@ -881,6 +912,8 @@ oxmem_write_blocking(const char *buf, size_t size, off_t offset,
     /* Free the last allocated send_ox that wasn't sent */
     if (send_ox)
         free(send_ox);
+
+    pthread_mutex_unlock(&read_lock);
 
     return size;
 }
@@ -965,6 +998,12 @@ nbd_server_thread(void *arg)
         case NBD_CMD_READ: {
             int result = oxmem_read_blocking(buffer, len, offset, bdev);
             if (result > 0) {
+                /* Update stats */
+                pthread_mutex_lock(&global_stats.lock);
+                global_stats.read_count++;
+                global_stats.read_bytes += len;
+                pthread_mutex_unlock(&global_stats.lock);
+
                 write(bdev->sk_pair[1], &reply, sizeof(reply));
                 write(bdev->sk_pair[1], buffer, len);
             } else {
@@ -992,6 +1031,13 @@ nbd_server_thread(void *arg)
                 break;
 
             int result = oxmem_write_blocking(buffer, len, offset, bdev);
+            if (result > 0) {
+                /* Update stats */
+                pthread_mutex_lock(&global_stats.lock);
+                global_stats.write_count++;
+                global_stats.write_bytes += len;
+                pthread_mutex_unlock(&global_stats.lock);
+            }
             reply.error = (result > 0) ? 0 : htonl(EIO);
             write(bdev->sk_pair[1], &reply, sizeof(reply));
             break;
@@ -1227,6 +1273,85 @@ recv_thread(void *arg)
     return NULL;
 }
 
+/**
+ * Stats thread - periodically writes I/O statistics to JSON file
+ */
+void *
+stats_thread(void *arg)
+{
+    FILE *fp;
+    uint64_t read_count, read_bytes, write_count, write_bytes;
+    uint64_t prev_read_count = 0, prev_read_bytes = 0;
+    uint64_t prev_write_count = 0, prev_write_bytes = 0;
+    uint64_t read_count_per_period, read_bytes_per_period;
+    uint64_t write_count_per_period, write_bytes_per_period;
+    time_t now;
+    char timestamp[64];
+
+    (void)arg;
+
+    printf("Stats thread started (updating %s every %d seconds)\n",
+           STATS_FILE_PATH, stats_update_interval);
+
+    while (!shutdown_requested) {
+        sleep(stats_update_interval);
+
+        if (shutdown_requested)
+            break;
+
+        /* Get current stats with lock */
+        pthread_mutex_lock(&global_stats.lock);
+        read_count = global_stats.read_count;
+        read_bytes = global_stats.read_bytes;
+        write_count = global_stats.write_count;
+        write_bytes = global_stats.write_bytes;
+        pthread_mutex_unlock(&global_stats.lock);
+
+        /* Calculate per-period stats */
+        read_count_per_period = read_count - prev_read_count;
+        read_bytes_per_period = read_bytes - prev_read_bytes;
+        write_count_per_period = write_count - prev_write_count;
+        write_bytes_per_period = write_bytes - prev_write_bytes;
+
+        /* Save current values for next period */
+        prev_read_count = read_count;
+        prev_read_bytes = read_bytes;
+        prev_write_count = write_count;
+        prev_write_bytes = write_bytes;
+
+        /* Get current timestamp */
+        now = time(NULL);
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", localtime(&now));
+
+        /* Write stats to JSON file */
+        fp = fopen(STATS_FILE_PATH, "w");
+        if (fp) {
+            fprintf(fp, "{\n");
+            fprintf(fp, "  \"timestamp\": \"%s\",\n", timestamp);
+            fprintf(fp, "  \"interval_seconds\": %d,\n", stats_update_interval);
+            fprintf(fp, "  \"read\": {\n");
+            fprintf(fp, "    \"count\": %lu,\n", read_count);
+            fprintf(fp, "    \"bytes\": %lu,\n", read_bytes);
+            fprintf(fp, "    \"count_per_period\": %lu,\n", read_count_per_period);
+            fprintf(fp, "    \"bytes_per_period\": %lu\n", read_bytes_per_period);
+            fprintf(fp, "  },\n");
+            fprintf(fp, "  \"write\": {\n");
+            fprintf(fp, "    \"count\": %lu,\n", write_count);
+            fprintf(fp, "    \"bytes\": %lu,\n", write_bytes);
+            fprintf(fp, "    \"count_per_period\": %lu,\n", write_count_per_period);
+            fprintf(fp, "    \"bytes_per_period\": %lu\n", write_bytes_per_period);
+            fprintf(fp, "  }\n");
+            fprintf(fp, "}\n");
+            fclose(fp);
+        } else {
+            LOG_ERROR("Failed to open %s: %s", STATS_FILE_PATH, strerror(errno));
+        }
+    }
+
+    printf("Stats thread exiting\n");
+    return NULL;
+}
+
 /*
  * =============================================================================
  * Command Line Parsing and Help
@@ -1276,17 +1401,18 @@ show_help(const char *progname)
     printf("Usage: %s [options]\n\n", progname);
     printf("OmniXtend Memory Block Device Driver\n\n");
     printf("Required options:\n"
-           "  --netdev=DEV    Network interface\n"
-           "  --mac=MAC       MAC address of OmniXtend endpoint\n"
-           "  --size=SIZE     Total size with unit G/M/K\n\n"
+           "  --netdev=DEV       Network interface\n"
+           "  --mac=MAC          MAC address of OmniXtend endpoint\n"
+           "  --size=SIZE        Total size with unit G/M/K\n\n"
            "Optional options:\n"
-           "  --base=ADDR     Base address in hex (default: 0x0)\n"
-           "  --num=N         Number of NBD devices (default: 1, max: %d)\n"
-           "  -h, --help      Show this help\n\n"
+           "  --base=ADDR        Base address in hex (default: 0x0)\n"
+           "  --num=N            Number of NBD devices (default: 1, max: %d)\n"
+           "  --stat-interval=N  Stats update interval in seconds (default: %d)\n"
+           "  -h, --help         Show this help\n\n"
            "Examples:\n"
            "  %s --netdev=eth0 --mac=04:00:00:00:00:00 --size=1G\n"
-           "  %s --netdev=eth0 --mac=04:00:00:00:00:00 --size=8G --num=4\n",
-           MAX_NBD_DEVICES, progname, progname);
+           "  %s --netdev=eth0 --mac=04:00:00:00:00:00 --size=8G --stat-interval=5\n",
+           MAX_NBD_DEVICES, STATS_UPDATE_INTERVAL_DEFAULT, progname, progname);
 }
 
 /*
@@ -1308,7 +1434,7 @@ main(int argc, char *argv[])
     struct sockaddr_ll saddr;
     pthread_t nbd_threads[MAX_NBD_DEVICES];
     pthread_t nbd_do_it_threads[MAX_NBD_DEVICES];
-    pthread_t send_tid, recv_tid, post_handler_tid;
+    pthread_t send_tid, recv_tid, post_handler_tid, stats_tid;
     size_t total_size, device_size;
     uint64_t my_mac;
 
@@ -1324,6 +1450,8 @@ main(int argc, char *argv[])
             base_str = argv[i] + 7;
         else if (strncmp(argv[i], "--num=", 6) == 0)
             num_str = argv[i] + 6;
+        else if (strncmp(argv[i], "--stat-interval=", 16) == 0)
+            stats_update_interval = atoi(argv[i] + 16);
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             show_help(argv[0]);
             return 0;
@@ -1343,6 +1471,11 @@ main(int argc, char *argv[])
             LOG_ERROR("--num must be between 1 and %d", MAX_NBD_DEVICES);
             return 1;
         }
+    }
+
+    if (stats_update_interval < 1) {
+        LOG_ERROR("--stat-interval must be at least 1 second");
+        return 1;
     }
 
     /* Setup signal handlers */
@@ -1437,7 +1570,8 @@ main(int argc, char *argv[])
 
     if (pthread_create(&send_tid, NULL, send_thread, NULL) != 0 ||
         pthread_create(&post_handler_tid, NULL, post_handler_thread, NULL) != 0 ||
-        pthread_create(&recv_tid, NULL, recv_thread, NULL) != 0) {
+        pthread_create(&recv_tid, NULL, recv_thread, NULL) != 0 ||
+        pthread_create(&stats_tid, NULL, stats_thread, NULL) != 0) {
         LOG_ERROR("Failed to create worker threads");
         close(global_state.oxmem_info.sockfd);
         return 1;
